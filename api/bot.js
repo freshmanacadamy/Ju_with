@@ -1367,6 +1367,275 @@ Contact admin if you need help.
   `);
 });
 
+// ==================== ADMIN TEXT COMMANDS ====================
+
+// List all registered users
+bot.command('registered', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const usersArray = Array.from(users.values());
+  const activeUsers = usersArray.filter(u => u.status === CONFIG.USER.STATUS.ACTIVE);
+  const blockedUsers = usersArray.filter(u => u.status === CONFIG.USER.STATUS.BLOCKED);
+  
+  const statsText = `📊 *Registered Users*\n\n` +
+    `👥 Total Users: ${usersArray.length}\n` +
+    `✅ Active Users: ${activeUsers.length}\n` +
+    `🚫 Blocked Users: ${blockedUsers.length}\n` +
+    `📈 Paid Referrals Total: ${usersArray.reduce((sum, user) => sum + user.paidReferrals, 0)}\n` +
+    `💰 Total Balance: ${usersArray.reduce((sum, user) => sum + user.balance, 0)} ETB`;
+  
+  await ctx.replyWithMarkdown(statsText);
+});
+
+// List users command
+bot.command('users', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const usersArray = Array.from(users.values())
+    .sort((a, b) => new Date(b.registrationDate) - new Date(a.registrationDate))
+    .slice(0, 20);
+  
+  let usersText = `👥 *Recent Users (Last 20)*\n\n`;
+  
+  if (usersArray.length === 0) {
+    usersText += `No users registered yet.`;
+  } else {
+    usersArray.forEach((user, index) => {
+      usersText += `${index + 1}. ${user.firstName} (@${user.username || 'no_username'})\n` +
+        `   🆔: ${user.telegramId} | 💰: ${user.balance} ETB\n` +
+        `   ✅ ${user.paidReferrals} paid | 📊 ${user.totalReferrals} total\n` +
+        `   📅 ${new Date(user.registrationDate).toLocaleDateString()}\n\n`;
+    });
+  }
+  
+  await ctx.replyWithMarkdown(usersText);
+});
+
+// User profile command
+bot.command('user', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const userId = ctx.message.text.split(' ')[1];
+  if (!userId) {
+    return ctx.reply('Usage: /user <user_id>');
+  }
+  
+  const user = users.get(userId) || Array.from(users.values()).find(u => u.username === userId);
+  if (!user) {
+    return ctx.reply('❌ User not found.');
+  }
+  
+  const userLevel = getUserLevel(user.paidReferrals);
+  const userText = `👤 *User Profile*\n\n` +
+    `🆔 User ID: ${user.telegramId}\n` +
+    `👤 Name: ${user.firstName} ${user.lastName || ''}\n` +
+    `📱 Username: @${user.username || 'N/A'}\n` +
+    `🎖️ Level: ${userLevel.title}\n` +
+    `📊 Status: ${user.status}\n\n` +
+    `💰 Balance: ${user.balance} ETB\n` +
+    `📈 Total Earned: ${user.totalEarned} ETB\n` +
+    `📉 Total Withdrawn: ${user.totalWithdrawn} ETB\n\n` +
+    `👥 Referrals: ${user.paidReferrals} paid / ${user.unpaidReferrals} unpaid / ${user.totalReferrals} total\n\n` +
+    `📅 Registered: ${new Date(user.registrationDate).toLocaleString()}\n` +
+    `⏰ Last Seen: ${new Date(user.lastSeen).toLocaleString()}`;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('📩 Message', `message_user_${user.telegramId}`),
+      Markup.button.callback(user.status === CONFIG.USER.STATUS.ACTIVE ? '🚫 Block' : '✅ Unblock', `admin_toggle_block_${user.telegramId}`)
+    ],
+    [
+      Markup.button.callback('💰 Adjust Balance', `admin_adjust_balance_${user.telegramId}`),
+      Markup.button.callback('📊 Edit Referrals', `admin_edit_refs_${user.telegramId}`)
+    ]
+  ]);
+  
+  await ctx.replyWithMarkdown(userText, keyboard);
+});
+
+// Block user command
+bot.command('block', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 2) {
+    return ctx.reply('Usage: /block <user_id>');
+  }
+  
+  const userId = args[1];
+  const user = users.get(userId);
+  
+  if (!user) {
+    return ctx.reply('❌ User not found.');
+  }
+  
+  users.set(userId, {
+    ...user,
+    status: CONFIG.USER.STATUS.BLOCKED,
+    blockReason: 'Manual block by admin',
+    blockedAt: new Date().toISOString()
+  });
+  
+  await ctx.reply(`✅ User ${user.firstName} (@${user.username || 'N/A'}) has been blocked.`);
+});
+
+// Unblock user command
+bot.command('unblock', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 2) {
+    return ctx.reply('Usage: /unblock <user_id>');
+  }
+  
+  const userId = args[1];
+  const user = users.get(userId);
+  
+  if (!user) {
+    return ctx.reply('❌ User not found.');
+  }
+  
+  users.set(userId, {
+    ...user,
+    status: CONFIG.USER.STATUS.ACTIVE,
+    blockReason: null,
+    blockedAt: null
+  });
+  
+  await ctx.reply(`✅ User ${user.firstName} (@${user.username || 'N/A'}) has been unblocked.`);
+});
+
+// Payments command
+bot.command('payments', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const pendingPayments = Array.from(payments.values())
+    .filter(p => p.status === CONFIG.PAYMENT.STATUS.PENDING);
+  
+  if (pendingPayments.length === 0) {
+    return ctx.reply('✅ No pending payments.');
+  }
+  
+  let paymentsText = `📸 *Pending Payments (${pendingPayments.length})*\n\n`;
+  
+  pendingPayments.forEach((payment, index) => {
+    const user = users.get(payment.userId);
+    paymentsText += `${index + 1}. ${user?.firstName || 'Unknown'} (@${user?.username || 'N/A'})\n` +
+      `   💰 ${payment.amount} ETB | 🆔 ${payment.paymentId}\n` +
+      `   📅 ${new Date(payment.submittedAt).toLocaleString()}\n\n`;
+  });
+  
+  await ctx.replyWithMarkdown(paymentsText);
+});
+
+// Stats command
+bot.command('stats', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const stats = await getAdminStats();
+  const usersArray = Array.from(users.values());
+  
+  const topReferrers = usersArray
+    .filter(u => u.paidReferrals > 0)
+    .sort((a, b) => b.paidReferrals - a.paidReferrals)
+    .slice(0, 5);
+  
+  let statsText = `📊 *Bot Statistics*\n\n` +
+    `👥 Users: ${stats.totalUsers} total\n` +
+    `💰 Payments: ${stats.totalPayments} total | ${stats.pendingPayments} pending\n` +
+    `💸 Withdrawals: ${stats.pendingWithdrawals} pending\n` +
+    `📈 Revenue: ${stats.totalRevenue} ETB\n\n` +
+    `🏆 *Top Referrers:*\n`;
+  
+  if (topReferrers.length === 0) {
+    statsText += `No top referrers yet.\n`;
+  } else {
+    topReferrers.forEach((user, index) => {
+      statsText += `${index + 1}. ${user.firstName} - ${user.paidReferrals} paid referrals\n`;
+    });
+  }
+  
+  statsText += `\n⚙️ *Bot Status:* ${botSettings.status === CONFIG.BOT.STATUS.ACTIVE ? '🟢 ACTIVE' : '🔴 MAINTENANCE'}`;
+  
+  await ctx.replyWithMarkdown(statsText);
+});
+
+// Export users command
+bot.command('export_users', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const usersArray = Array.from(users.values());
+  let csv = 'User ID,Name,Username,Phone,Balance,Paid Referrals,Total Referrals,Status,Registration Date\n';
+  
+  usersArray.forEach(user => {
+    csv += `${user.telegramId},"${user.firstName} ${user.lastName || ''}","${user.username || 'N/A'}","${user.phone || 'N/A'}",${user.balance},${user.paidReferrals},${user.totalReferrals},${user.status},"${user.registrationDate}"\n`;
+  });
+  
+  const filename = `users_export_${new Date().toISOString().split('T')[0]}.csv`;
+  
+  await ctx.replyWithDocument({
+    source: Buffer.from(csv, 'utf8'),
+    filename: filename
+  }, {
+    caption: `📊 Exported: ${filename}\nTotal Users: ${usersArray.length}`
+  });
+});
+
+// Broadcast command
+bot.command('broadcast', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.reply('❌ Access denied. Admin only.');
+  }
+  
+  const message = ctx.message.text.replace('/broadcast', '').trim();
+  if (!message) {
+    return ctx.reply('Usage: /broadcast <your_message>');
+  }
+  
+  const usersArray = Array.from(users.values());
+  let successCount = 0;
+  let failCount = 0;
+  
+  await ctx.reply(`📢 Starting broadcast to ${usersArray.length} users...`);
+  
+  for (const user of usersArray) {
+    try {
+      await ctx.telegram.sendMessage(
+        user.telegramId,
+        `📢 *ANNOUNCEMENT*\n\n${message}`
+      );
+      successCount++;
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } catch (error) {
+      failCount++;
+    }
+  }
+  
+  await ctx.reply(
+    `✅ *Broadcast Completed*\n\n` +
+    `📨 Sent to: ${successCount} users\n` +
+    `❌ Failed: ${failCount} users\n` +
+    `📊 Success rate: ${((successCount / usersArray.length) * 100).toFixed(1)}%`
+  );
+});
+
 // ==================== VERCEL WEBHOOK HANDLER ====================
 module.exports = async (req, res) => {
   try {

@@ -1,1662 +1,2020 @@
 require('dotenv').config();
-const { Telegraf, Markup } = require('telegraf');
+const { Telegraf, Markup, session } = require('telegraf');
+const admin = require('firebase-admin');
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-
-// ==================== CONFIGURATION ====================
-const CONFIG = {
-  BOT: {
-    STATUS: { ACTIVE: 'active', MAINTENANCE: 'maintenance' }
-  },
-  USER: {
-    STATUS: { ACTIVE: 'active', BLOCKED: 'blocked', PENDING: 'pending' }
-  },
-  PAYMENT: {
-    DEFAULT_AMOUNT: 500,
-    STATUS: { PENDING: 'pending', APPROVED: 'approved', REJECTED: 'rejected' }
-  },
-  WITHDRAWAL: {
-    MIN_PAID_REFERRALS: 4,
-    MIN_AMOUNT: 100,
-    COMMISSION_PER_REFERRAL: 250,
-    STATUS: { PENDING: 'pending', APPROVED: 'approved', REJECTED: 'rejected' }
-  },
-  ADMIN: {
-    ROLES: { SUPER_ADMIN: 'super_admin', ADMIN: 'admin', MODERATOR: 'moderator' }
-  }
+// Initialize Firebase
+const serviceAccount = {
+  type: "service_account",
+  project_id: process.env.FIREBASE_PROJECT_ID,
+  private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  client_email: process.env.FIREBASE_CLIENT_EMAIL,
 };
 
-// ==================== DATA STORAGE ====================
-let users = new Map();
-let payments = new Map();
-let withdrawals = new Map();
-let referrals = new Map();
-let botSettings = {
-  status: CONFIG.BOT.STATUS.ACTIVE,
-  features: {
-    registration: true,
-    screenshot_upload: true,
-    payments: true,
-    referrals: true,
-    withdrawals: true
-  },
-  maintenance_message: '🚧 Bot is under maintenance. Please try again later.',
-  payment_methods: {
-    telebirr: {
-      account_name: 'JU Registration',
-      account_number: '251912345678',
-      active: true,
-      instructions: 'Send via Telebirr App to this number'
-    },
-    cbe: {
-      account_name: 'JU University',
-      account_number: '1000234567890',
-      active: true,
-      instructions: 'Transfer to CBE Account'
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
+
+const db = admin.firestore();
+const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// Global variables (will be reset on restart, but we'll use Firestore as source of truth)
+let confessionCounter = 0; // This will be updated from Firestore
+
+// Initialize confession counter from Firestore (source of truth)
+async function initializeCounter() {
+  try {
+    // Get the system counters document
+    const counterDoc = await db.collection('system').doc('counters').get();
+    
+    if (!counterDoc.exists) {
+      // Initialize if doesn't exist
+      const snapshot = await db.collection('confessions')
+        .where('status', '==', 'approved')
+        .orderBy('confessionNumber', 'desc')
+        .limit(1)
+        .get();
+      
+      let maxConfession = 0;
+      if (!snapshot.empty) {
+        maxConfession = snapshot.docs[0].data().confessionNumber || 0;
+      }
+      
+      // Set initial counter
+      await db.collection('system').doc('counters').set({
+        confessionNumber: maxConfession,
+        lastAssigned: new Date().toISOString(),
+        initialized: new Date().toISOString()
+      });
+      
+      confessionCounter = maxConfession;
+      console.log(`Initialized confession counter: ${confessionCounter}`);
+    } else {
+      const data = counterDoc.data();
+      confessionCounter = data.confessionNumber || 0;
+      console.log(`Loaded confession counter from Firestore: ${confessionCounter}`);
+    }
+  } catch (error) {
+    console.error('Counter init error:', error);
+    // Fallback: try to get from confessions
+    try {
+      const snapshot = await db.collection('confessions')
+        .where('status', '==', 'approved')
+        .orderBy('confessionNumber', 'desc')
+        .limit(1)
+        .get();
+      
+      if (!snapshot.empty) {
+        const latest = snapshot.docs[0].data();
+        confessionCounter = latest.confessionNumber || 0;
+      }
+    } catch (fallbackError) {
+      console.error('Fallback counter init also failed:', fallbackError);
+      confessionCounter = 0;
     }
   }
-};
-
-// ==================== HELPER FUNCTIONS ====================
-function isAdmin(userId) {
-  const adminIds = process.env.ADMIN_IDS?.split(',') || [];
-  return adminIds.includes(userId.toString());
 }
 
-function generateReferralCode(firstName) {
-  const randomNum = Math.floor(100 + Math.random() * 900);
-  return `${firstName.substring(0, 3).toUpperCase()}${randomNum}`;
-}
-
-function getUserLevel(paidReferrals) {
-  if (paidReferrals >= 50) return { level: 5, title: '🌟 Elite' };
-  if (paidReferrals >= 25) return { level: 4, title: '🔥 Pro' };
-  if (paidReferrals >= 15) return { level: 3, title: '💎 Advanced' };
-  if (paidReferrals >= 8) return { level: 2, title: '⭐ Intermediate' };
-  if (paidReferrals >= 1) return { level: 1, title: '🚀 Beginner' };
-  return { level: 0, title: '🌱 New' };
-}
-
-async function notifyAdmins(message, keyboard = null) {
-  const adminIds = process.env.ADMIN_IDS?.split(',') || [];
-  for (const adminId of adminIds) {
-    try {
-      if (keyboard) {
-        await bot.telegram.sendMessage(adminId, message, {
-          parse_mode: 'Markdown',
-          reply_markup: keyboard
+// Get next confession number using Firestore transaction (atomic operation)
+async function getNextConfessionNumber() {
+  const counterRef = db.collection('system').doc('counters');
+  
+  try {
+    const result = await db.runTransaction(async (transaction) => {
+      const doc = await transaction.get(counterRef);
+      
+      if (!doc.exists) {
+        // Initialize if doesn't exist
+        transaction.set(counterRef, {
+          confessionNumber: 1,
+          lastAssigned: new Date().toISOString()
         });
-      } else {
-        await bot.telegram.sendMessage(adminId, message, {
-          parse_mode: 'Markdown'
+        return 1;
+      }
+      
+      const current = doc.data().confessionNumber;
+      const next = current + 1;
+      
+      transaction.update(counterRef, {
+        confessionNumber: next,
+        lastAssigned: new Date().toISOString()
+      });
+      
+      return next;
+    });
+    
+    return result;
+  } catch (error) {
+    console.error('Transaction failed: ', error);
+    throw error;
+  }
+}
+
+// Persistent cooldown system using Firestore - FIXED: Removed memory Map
+async function checkCooldown(userId, action = 'confession', cooldownMs = 60000) {
+  const cooldownRef = db.collection('user_cooldowns').doc(userId.toString());
+  const doc = await cooldownRef.get();
+  
+  if (!doc.exists) return true; // No cooldown record, allowed
+  
+  const data = doc.data();
+  const lastAction = data[action];
+  
+  if (!lastAction) return true; // No action recorded for this type, allowed
+  
+  return (Date.now() - lastAction) > cooldownMs; // Return true if cooldown expired
+}
+
+async function setCooldown(userId, action = 'confession') {
+  const cooldownRef = db.collection('user_cooldowns').doc(userId.toString());
+  await cooldownRef.set({
+    [action]: Date.now(),
+    updatedAt: new Date().toISOString()
+  }, { merge: true });
+}
+
+// Comment rate limiting
+async function checkCommentRateLimit(userId, windowMs = 30000, maxComments = 3) { // 30 seconds, 3 comments
+  const rateLimitRef = db.collection('user_rate_limits').doc(userId.toString());
+  const doc = await rateLimitRef.get();
+  
+  if (!doc.exists) return true; // No rate limit record, allowed
+  
+  const data = doc.data();
+  const recentComments = data.commentTimestamps || [];
+  
+  // Filter timestamps within the window
+  const now = Date.now();
+  const recent = recentComments.filter(ts => (now - ts) <= windowMs);
+  
+  return recent.length < maxComments; // Return true if under limit
+}
+
+async function recordComment(userId) {
+  const rateLimitRef = db.collection('user_rate_limits').doc(userId.toString());
+  const now = Date.now();
+  
+  await db.runTransaction(async (transaction) => {
+    const doc = await transaction.get(rateLimitRef);
+    
+    if (!doc.exists) {
+      transaction.set(rateLimitRef, {
+        commentTimestamps: [now],
+        updatedAt: new Date().toISOString()
+      });
+    } else {
+      transaction.update(rateLimitRef, {
+        commentTimestamps: admin.firestore.FieldValue.arrayUnion(now),
+        updatedAt: new Date().toISOString()
+      });
+    }
+  });
+  
+  // Clean up old timestamps (optional cleanup)
+  setTimeout(async () => {
+    try {
+      const doc = await rateLimitRef.get();
+      if (doc.exists) {
+        const data = doc.data();
+        const now = Date.now();
+        const recent = data.commentTimestamps.filter(ts => (now - ts) <= 30000); // 30 second window
+        
+        await rateLimitRef.update({
+          commentTimestamps: recent
         });
       }
     } catch (error) {
-      console.error(`Failed to notify admin ${adminId}:`, error);
+      console.error('Cleanup error:', error);
     }
-  }
+  }, 1000); // Cleanup after 1 second
 }
 
-// ==================== MIDDLEWARE ====================
+// Initialize session and counter
+bot.use(session());
 bot.use(async (ctx, next) => {
-  // Initialize session
   ctx.session = ctx.session || {};
-  
-  // Get user data
-  const userData = users.get(ctx.from?.id);
-  ctx.userData = userData;
-  
-  // Check if user is blocked
-  if (userData?.status === CONFIG.USER.STATUS.BLOCKED) {
-    await ctx.reply('❌ Your account has been blocked. Contact admin for support.');
-    return;
-  }
-  
-  // Check maintenance mode
-  if (botSettings.status === CONFIG.BOT.STATUS.MAINTENANCE && !isAdmin(ctx.from?.id)) {
-    await ctx.reply(botSettings.maintenance_message);
-    return;
-  }
-  
   await next();
 });
 
-// ==================== START & REGISTRATION ====================
-bot.start(async (ctx) => {
-  const userId = ctx.from.id;
-  
-  // Check if registration is enabled
-  if (!botSettings.features.registration && !users.has(userId)) {
-    return ctx.reply('❌ Registration is currently disabled.');
+// ==================== ADMIN VERIFICATION ====================
+function isAdmin(userId) {
+  // Validate input
+  if (!userId || typeof userId !== 'number' && typeof userId !== 'string') {
+    return false;
   }
   
-  if (!users.has(userId)) {
-    // New user registration
-    const referralCode = generateReferralCode(ctx.from.first_name);
-    const referredBy = ctx.startPayload; // Get referral code from deep link
-    
-    const userData = {
-      telegramId: userId,
-      username: ctx.from.username,
-      firstName: ctx.from.first_name,
-      lastName: ctx.from.last_name || '',
-      language: 'en',
-      status: CONFIG.USER.STATUS.ACTIVE,
-      balance: 0,
-      totalEarned: 0,
-      totalWithdrawn: 0,
-      paidReferrals: 0,
-      unpaidReferrals: 0,
-      totalReferrals: 0,
-      referralCode: referralCode,
-      registrationDate: new Date().toISOString(),
-      lastSeen: new Date().toISOString()
-    };
-    
-    users.set(userId, userData);
-    
-    // Handle referral
-    if (referredBy) {
-      const referrer = Array.from(users.values()).find(u => u.referralCode === referredBy);
-      if (referrer) {
-        // Update referrer stats
-        users.set(referrer.telegramId, {
-          ...referrer,
-          totalReferrals: referrer.totalReferrals + 1,
-          unpaidReferrals: referrer.unpaidReferrals + 1
-        });
-        
-        // Store referral record
-        referrals.set(`${referrer.telegramId}_${userId}`, {
-          referrerId: referrer.telegramId,
-          referredUserId: userId,
-          status: 'pending',
-          date: new Date().toISOString()
-        });
-      }
-    }
-    
-    await ctx.reply(`🎉 Welcome to JU Registration Bot, ${ctx.from.first_name}!\n\nStart earning by referring friends! Each successful referral earns you ${CONFIG.WITHDRAWAL.COMMISSION_PER_REFERRAL} ETB.`);
-  }
-  
-  await showMainMenu(ctx);
-});
-
-// ==================== MAIN MENU ====================
-async function showMainMenu(ctx) {
-  const menuText = `🎯 *Main Menu*\n\nChoose an option:`;
-  
-  const keyboard = Markup.keyboard([
-    ['💰 Balance', '👥 My Referrals'],
-    ['🏆 Leaderboard', '💸 Withdraw'],
-    [isAdmin(ctx.from.id) ? '🔧 Admin' : '⚙️ Settings']
-  ]).resize();
-  
-  await ctx.replyWithMarkdown(menuText, keyboard);
+  const adminIds = process.env.ADMIN_IDS?.split(',').map(id => id.trim()) || [];
+  return adminIds.includes(userId.toString());
 }
 
-bot.command('menu', async (ctx) => {
-  await showMainMenu(ctx);
-});
+// ==================== INPUT SANITIZATION ====================
+function sanitizeInput(text) {
+  if (!text) return '';
+  
+  // Remove potentially dangerous characters
+  let sanitized = text
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '') // Remove script tags
+    .replace(/javascript:/gi, '') // Remove javascript protocol
+    .replace(/on\w+="[^"]*"/gi, '') // Remove event handlers
+    .replace(/<[^>]*>/g, '') // Remove HTML tags
+    .trim();
+  
+  return sanitized;
+}
 
-// ==================== BALANCE COMMAND ====================
-bot.hears('💰 Balance', async (ctx) => {
-  const user = users.get(ctx.from.id);
-  if (!user) return ctx.reply('Please use /start first.');
-  
-  const needed = CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS - user.paidReferrals;
-  const eligible = user.paidReferrals >= CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS;
-  const userLevel = getUserLevel(user.paidReferrals);
-  
-  const balanceText = `💰 *Your Balance*\n\n` +
-    `🎖️ Level: ${userLevel.title}\n` +
-    `💵 Available Balance: *${user.balance} ETB*\n` +
-    `📈 Total Earned: *${user.totalEarned} ETB*\n` +
-    `📉 Total Withdrawn: *${user.totalWithdrawn} ETB*\n\n` +
-    `👥 Referral Stats:\n` +
-    `✅ Paid Referrals: *${user.paidReferrals}*\n` +
-    `⏳ Unpaid Referrals: *${user.unpaidReferrals}*\n` +
-    `📊 Total Referrals: *${user.totalReferrals}*\n\n` +
-    (eligible ? 
-      `🎉 *You are eligible for withdrawal!*` : 
-      `❌ Need *${needed}* more paid referrals to withdraw`);
-  
-  await ctx.replyWithMarkdown(balanceText);
-});
-
-bot.command('balance', async (ctx) => {
-  const user = users.get(ctx.from.id);
-  if (!user) return ctx.reply('Please use /start first.');
-  
-  const needed = CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS - user.paidReferrals;
-  const eligible = user.paidReferrals >= CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS;
-  const userLevel = getUserLevel(user.paidReferrals);
-  
-  const balanceText = `💰 *Your Balance*\n\n` +
-    `🎖️ Level: ${userLevel.title}\n` +
-    `💵 Available Balance: *${user.balance} ETB*\n` +
-    `📈 Total Earned: *${user.totalEarned} ETB*\n` +
-    `📉 Total Withdrawn: *${user.totalWithdrawn} ETB*\n\n` +
-    `👥 Referral Stats:\n` +
-    `✅ Paid Referrals: *${user.paidReferrals}*\n` +
-    `⏳ Unpaid Referrals: *${user.unpaidReferrals}*\n` +
-    `📊 Total Referrals: *${user.totalReferrals}*\n\n` +
-    (eligible ? 
-      `🎉 *You are eligible for withdrawal!*` : 
-      `❌ Need *${needed}* more paid referrals to withdraw`);
-  
-  await ctx.replyWithMarkdown(balanceText);
-});
-
-// ==================== REFERRALS COMMAND ====================
-bot.hears('👥 My Referrals', async (ctx) => {
-  const user = users.get(ctx.from.id);
-  if (!user) return ctx.reply('Please use /start first.');
-  
-  const referralText = `👥 *Your Referral Network*\n\n` +
-    `Your Referral Code: \`${user.referralCode}\`\n\n` +
-    `Share this link to invite friends:\n` +
-    `https://t.me/${process.env.BOT_USERNAME}?start=${user.referralCode}\n\n` +
-    `You earn *${CONFIG.WITHDRAWAL.COMMISSION_PER_REFERRAL} ETB* for each paid referral!\n\n` +
-    `*Your Stats:*\n` +
-    `✅ ${user.paidReferrals} paid • ⏳ ${user.unpaidReferrals} unpaid • 📊 ${user.totalReferrals} total`;
-  
-  await ctx.replyWithMarkdown(referralText);
-});
-
-bot.command('referrals', async (ctx) => {
-  const user = users.get(ctx.from.id);
-  if (!user) return ctx.reply('Please use /start first.');
-  
-  const referralText = `👥 *Your Referral Network*\n\n` +
-    `Your Referral Code: \`${user.referralCode}\`\n\n` +
-    `Share this link to invite friends:\n` +
-    `https://t.me/${process.env.BOT_USERNAME}?start=${user.referralCode}\n\n` +
-    `You earn *${CONFIG.WITHDRAWAL.COMMISSION_PER_REFERRAL} ETB* for each paid referral!\n\n` +
-    `*Your Stats:*\n` +
-    `✅ ${user.paidReferrals} paid • ⏳ ${user.unpaidReferrals} unpaid • 📊 ${user.totalReferrals} total`;
-  
-  await ctx.replyWithMarkdown(referralText);
-});
-
-// ==================== LEADERBOARD COMMAND ====================
-bot.hears('🏆 Leaderboard', async (ctx) => {
-  const topUsers = Array.from(users.values())
-    .filter(u => u.paidReferrals > 0)
-    .sort((a, b) => b.paidReferrals - a.paidReferrals)
-    .slice(0, 6);
-  
-  const currentUser = users.get(ctx.from.id);
-  
-  let leaderboardText = `🏆 *Top Referrers*\n\n`;
-  
-  if (topUsers.length === 0) {
-    leaderboardText += `No users on leaderboard yet. Be the first!`;
-  } else {
-    topUsers.forEach((user, index) => {
-      const rankEmoji = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣'][index];
-      const userLevel = getUserLevel(user.paidReferrals);
-      leaderboardText += `${rankEmoji} ${userLevel.title} *${user.firstName}*\n   📊 ${user.paidReferrals} paid • ${user.totalReferrals} total\n\n`;
+// ==================== REPUTATION SYSTEM ====================
+async function updateReputation(userId, points) {
+  try {
+    await db.collection('users').doc(userId.toString()).update({
+      reputation: admin.firestore.FieldValue.increment(points)
     });
+  } catch (error) {
+    console.error('Reputation update error:', error);
+    // Log error but don't fail the operation
+  }
+}
+
+// ==================== ACHIEVEMENT SYSTEM ====================
+async function checkAchievements(userId) {
+  const profile = await getUserProfile(userId);
+  
+  const achievements = [];
+  
+  // First Confession Achievement
+  if (profile.totalConfessions >= 1 && !profile.achievements?.includes('first_confession')) {
+    achievements.push('first_confession');
+    await awardAchievement(userId, 'first_confession', 'First Confession!');
   }
   
-  // Find user's rank
-  const allUsers = Array.from(users.values())
-    .filter(u => u.paidReferrals > 0)
-    .sort((a, b) => b.paidReferrals - a.paidReferrals);
+  // 10 Confessions Achievement
+  if (profile.totalConfessions >= 10 && !profile.achievements?.includes('ten_confessions')) {
+    achievements.push('ten_confessions');
+    await awardAchievement(userId, 'ten_confessions', 'Confession Master (10)!');
+  }
   
-  const userRank = allUsers.findIndex(u => u.telegramId === ctx.from.id) + 1;
-  const userLevel = getUserLevel(currentUser.paidReferrals);
+  // 50 Followers Achievement
+  if (profile.followers?.length >= 50 && !profile.achievements?.includes('fifty_followers')) {
+    achievements.push('fifty_followers');
+    await awardAchievement(userId, 'fifty_followers', 'Popular User (50 followers)!');
+  }
   
-  leaderboardText += `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `*Your Position:* ${userRank > 0 ? `#${userRank}` : 'Not ranked'}\n` +
-    `*Your Level:* ${userLevel.title}\n` +
-    `*Paid Referrals:* ${currentUser.paidReferrals}`;
-  
-  await ctx.replyWithMarkdown(leaderboardText);
-});
+  // Daily Streak Achievement
+  if (profile.dailyStreak >= 7 && !profile.achievements?.includes('week_streak')) {
+    achievements.push('week_streak');
+    await awardAchievement(userId, 'week_streak', 'Week Streak!');
+  }
+}
 
-bot.command('leaderboard', async (ctx) => {
-  const topUsers = Array.from(users.values())
-    .filter(u => u.paidReferrals > 0)
-    .sort((a, b) => b.paidReferrals - a.paidReferrals)
-    .slice(0, 6);
-  
-  const currentUser = users.get(ctx.from.id);
-  
-  let leaderboardText = `🏆 *Top Referrers*\n\n`;
-  
-  if (topUsers.length === 0) {
-    leaderboardText += `No users on leaderboard yet. Be the first!`;
-  } else {
-    topUsers.forEach((user, index) => {
-      const rankEmoji = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣'][index];
-      const userLevel = getUserLevel(user.paidReferrals);
-      leaderboardText += `${rankEmoji} ${userLevel.title} *${user.firstName}*\n   📊 ${user.paidReferrals} paid • ${user.totalReferrals} total\n\n`;
+async function awardAchievement(userId, achievementId, message) {
+  try {
+    await db.collection('users').doc(userId.toString()).update({
+      achievements: admin.firestore.FieldValue.arrayUnion(achievementId),
+      achievementCount: admin.firestore.FieldValue.increment(1)
     });
+    
+    // Notify user about achievement
+    await bot.telegram.sendMessage(userId, `🎉 Achievement Unlocked!\n\n${message}`);
+  } catch (error) {
+    console.error('Achievement award error:', error);
+  }
+}
+
+// ==================== HASHTAG SYSTEM ====================
+function extractHashtags(text) {
+  const hashtagRegex = /#[a-zA-Z0-9_]+/g;
+  return text.match(hashtagRegex) || [];
+}
+
+// ==================== USER PROFILE MANAGEMENT ====================
+async function getUserProfile(userId) {
+  const userDoc = await db.collection('users').doc(userId.toString()).get();
+  
+  if (!userDoc.exists) {
+    // Create default profile
+    const newProfile = {
+      userId: userId,
+      username: null,
+      bio: null,
+      followers: [],
+      following: [],
+      joinDate: new Date().toISOString(),
+      totalConfessions: 0,
+      reputation: 0,
+      isActive: true,
+      isRegistered: false,
+      achievements: [],
+      achievementCount: 0,
+      dailyStreak: 0,
+      lastCheckin: null,
+      notifications: {
+        confessionApproved: true,
+        newComment: true,
+        newFollower: true,
+        newConfession: true
+      },
+      tags: []
+    };
+    
+    await db.collection('users').doc(userId.toString()).set(newProfile);
+    return newProfile;
   }
   
-  // Find user's rank
-  const allUsers = Array.from(users.values())
-    .filter(u => u.paidReferrals > 0)
-    .sort((a, b) => b.paidReferrals - a.paidReferrals);
+  return userDoc.data();
+}
+
+// ==================== TRENDING SYSTEM ====================
+async function getTrendingConfessions(limit = 5) {
+  const confessionsSnapshot = await db.collection('confessions')
+    .where('status', '==', 'approved')
+    .orderBy('totalComments', 'desc')
+    .limit(limit)
+    .get();
   
-  const userRank = allUsers.findIndex(u => u.telegramId === ctx.from.id) + 1;
-  const userLevel = getUserLevel(currentUser.paidReferrals);
+  return confessionsSnapshot.docs.map(doc => doc.data());
+}
+
+// ==================== DAILY CHECKIN SYSTEM ====================
+bot.command('checkin', async (ctx) => {
+  const userId = ctx.from.id;
+  const profile = await getUserProfile(userId);
   
-  leaderboardText += `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `*Your Position:* ${userRank > 0 ? `#${userRank}` : 'Not ranked'}\n` +
-    `*Your Level:* ${userLevel.title}\n` +
-    `*Paid Referrals:* ${currentUser.paidReferrals}`;
+  if (!profile.isActive) {
+    await ctx.reply('❌ Your account has been blocked by admin.');
+    return;
+  }
   
-  await ctx.replyWithMarkdown(leaderboardText);
+  const today = new Date().toDateString();
+  const lastCheckin = profile.lastCheckin ? new Date(profile.lastCheckin).toDateString() : null;
+  
+  if (lastCheckin === today) {
+    await ctx.reply(`✅ You already checked in today!\n\nCurrent streak: ${profile.dailyStreak} days`);
+    return;
+  }
+  
+  let newStreak = 1;
+  if (lastCheckin) {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    if (lastCheckin === yesterday.toDateString()) {
+      newStreak = profile.dailyStreak + 1;
+    }
+  }
+  
+  await db.collection('users').doc(userId.toString()).update({
+    dailyStreak: newStreak,
+    lastCheckin: new Date().toISOString()
+  });
+  
+  await updateReputation(userId, 2); // 2 points for daily checkin
+  
+  await ctx.reply(`🎉 Daily Check-in!\n\n✅ +2 reputation points\nCurrent streak: ${newStreak} days`);
+  
+  // Check for streak achievements
+  await checkAchievements(userId);
 });
 
-// ==================== PAYMENT METHODS ====================
-bot.hears('💳 Payment Methods', async (ctx) => {
-  if (!botSettings.features.payments) {
-    return ctx.reply('❌ Payment feature is currently disabled.');
+// ==================== ADMIN DASHBOARD ====================
+bot.command('admin', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.reply('❌ Access denied. Admin only command.');
+    return;
   }
   
-  let paymentText = `💳 *Available Payment Methods*\n\n`;
+  const stats = await getBotStats();
   
-  Object.entries(botSettings.payment_methods).forEach(([method, data]) => {
-    if (data.active) {
-      paymentText += `📱 *${method.toUpperCase()}*\n` +
-        `Account: \`${data.account_number}\`\n` +
-        `Name: ${data.account_name}\n` +
-        `Instructions: ${data.instructions}\n\n`;
+  const text = `🔐 *Admin Dashboard*\n\n`;
+  const users = `**Total Users:** ${stats.totalUsers}\n`;
+  const confessions = `**Pending Confessions:** ${stats.pendingConfessions}\n`;
+  const approved = `**Approved Confessions:** ${stats.approvedConfessions}\n`;
+  const rejected = `**Rejected Confessions:** ${stats.rejectedConfessions}\n`;
+  
+  const fullText = text + users + confessions + approved + rejected;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('👥 Manage Users', 'manage_users')],
+    [Markup.button.callback('📝 Review Confessions', 'review_confessions')],
+    [Markup.button.callback('📢 Broadcast Message', 'broadcast_message')],
+    [Markup.button.callback('📊 Bot Statistics', 'bot_stats')],
+    [Markup.button.callback('❌ Block User', 'block_user')],
+    [Markup.button.callback('✅ Unblock User', 'unblock_user')]
+  ]);
+
+  await ctx.replyWithMarkdown(fullText, keyboard);
+});
+
+// Get bot statistics
+async function getBotStats() {
+  const usersSnapshot = await db.collection('users').get();
+  const confessionsSnapshot = await db.collection('confessions').get();
+  
+  let pending = 0, approved = 0, rejected = 0;
+  
+  confessionsSnapshot.forEach(doc => {
+    const data = doc.data();
+    switch (data.status) {
+      case 'pending': pending++; break;
+      case 'approved': approved++; break;
+      case 'rejected': rejected++; break;
     }
   });
   
-  paymentText += `*After payment, send screenshot as proof.*`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('📸 Send Screenshot', 'upload_screenshot')]
-  ]);
-  
-  await ctx.replyWithMarkdown(paymentText, keyboard);
-});
-
-// ==================== CONTINUE TO PART 2 ====================
-// ==================== WITHDRAWAL SYSTEM ====================
-bot.hears('💸 Withdraw', async (ctx) => {
-  if (!botSettings.features.withdrawals) {
-    return ctx.reply('❌ Withdrawal feature is currently disabled.');
-  }
-  
-  const user = users.get(ctx.from.id);
-  if (!user) return ctx.reply('Please use /start first.');
-  
-  // Check eligibility
-  if (user.paidReferrals < CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS) {
-    const needed = CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS - user.paidReferrals;
-    return ctx.reply(
-      `❌ *Withdrawal Not Eligible*\n\n` +
-      `You need *${CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS}* paid referrals to withdraw.\n` +
-      `You have *${user.paidReferrals}* paid referrals.\n` +
-      `Need *${needed}* more paid referrals.`
-    );
-  }
-  
-  if (user.balance < CONFIG.WITHDRAWAL.MIN_AMOUNT) {
-    return ctx.reply(
-      `❌ *Insufficient Balance*\n\n` +
-      `Minimum withdrawal amount: *${CONFIG.WITHDRAWAL.MIN_AMOUNT} ETB*\n` +
-      `Your balance: *${user.balance} ETB*`
-    );
-  }
-  
-  const withdrawalText = `💸 *Request Withdrawal*\n\n` +
-    `Available Balance: *${user.balance} ETB*\n` +
-    `Minimum Withdrawal: *${CONFIG.WITHDRAWAL.MIN_AMOUNT} ETB*\n\n` +
-    `Please send the withdrawal details in this format:\n\n` +
-    `\`Amount|PaymentMethod|AccountNumber\`\n\n` +
-    `*Example:*\n` +
-    `\`1000|telebirr|251912345678\`\n\n` +
-    `*Available Methods:* ${Object.keys(botSettings.payment_methods).filter(m => botSettings.payment_methods[m].active).join(', ')}`;
-  
-  ctx.session.waitingForWithdrawal = true;
-  await ctx.replyWithMarkdown(withdrawalText);
-});
-
-bot.command('withdraw', async (ctx) => {
-  if (!botSettings.features.withdrawals) {
-    return ctx.reply('❌ Withdrawal feature is currently disabled.');
-  }
-  
-  const user = users.get(ctx.from.id);
-  if (!user) return ctx.reply('Please use /start first.');
-  
-  // Check eligibility
-  if (user.paidReferrals < CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS) {
-    const needed = CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS - user.paidReferrals;
-    return ctx.reply(
-      `❌ *Withdrawal Not Eligible*\n\n` +
-      `You need *${CONFIG.WITHDRAWAL.MIN_PAID_REFERRALS}* paid referrals to withdraw.\n` +
-      `You have *${user.paidReferrals}* paid referrals.\n` +
-      `Need *${needed}* more paid referrals.`
-    );
-  }
-  
-  if (user.balance < CONFIG.WITHDRAWAL.MIN_AMOUNT) {
-    return ctx.reply(
-      `❌ *Insufficient Balance*\n\n` +
-      `Minimum withdrawal amount: *${CONFIG.WITHDRAWAL.MIN_AMOUNT} ETB*\n` +
-      `Your balance: *${user.balance} ETB*`
-    );
-  }
-  
-  const withdrawalText = `💸 *Request Withdrawal*\n\n` +
-    `Available Balance: *${user.balance} ETB*\n` +
-    `Minimum Withdrawal: *${CONFIG.WITHDRAWAL.MIN_AMOUNT} ETB*\n\n` +
-    `Please send the withdrawal details in this format:\n\n` +
-    `\`Amount|PaymentMethod|AccountNumber\`\n\n` +
-    `*Example:*\n` +
-    `\`1000|telebirr|251912345678\`\n\n` +
-    `*Available Methods:* ${Object.keys(botSettings.payment_methods).filter(m => botSettings.payment_methods[m].active).join(', ')}`;
-  
-  ctx.session.waitingForWithdrawal = true;
-  await ctx.replyWithMarkdown(withdrawalText);
-});
-
-// ==================== PAYMENT SCREENSHOT HANDLING ====================
-bot.on('photo', async (ctx) => {
-  if (!botSettings.features.screenshot_upload) {
-    return ctx.reply('❌ Screenshot upload is currently disabled.');
-  }
-  
-  const user = users.get(ctx.from.id);
-  if (!user) return;
-  
-  const photo = ctx.message.photo[ctx.message.photo.length - 1];
-  const fileId = photo.file_id;
-  
-  try {
-    const paymentId = `PAY_${ctx.from.id}_${Date.now()}`;
-    const paymentData = {
-      paymentId: paymentId,
-      userId: ctx.from.id,
-      screenshotFileId: fileId,
-      amount: CONFIG.PAYMENT.DEFAULT_AMOUNT,
-      status: CONFIG.PAYMENT.STATUS.PENDING,
-      submittedAt: new Date().toISOString(),
-      method: 'manual'
-    };
-    
-    payments.set(paymentId, paymentData);
-    
-    // Notify admins
-    const notificationText = `📸 *NEW PAYMENT SUBMISSION*\n\n` +
-      `👤 User: ${user.firstName} ${user.lastName || ''}\n` +
-      `📱 Username: @${user.username || 'N/A'}\n` +
-      `🆔 User ID: ${ctx.from.id}\n` +
-      `💰 Amount: ${CONFIG.PAYMENT.DEFAULT_AMOUNT} ETB\n` +
-      `🆔 Payment ID: ${paymentId}\n` +
-      `⏰ Time: ${new Date().toLocaleString()}\n\n` +
-      `*Quick Actions:*`;
-    
-    const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback('✅ Approve', `approve_payment_${paymentId}`),
-        Markup.button.callback('❌ Reject', `reject_payment_${paymentId}`)
-      ],
-      [
-        Markup.button.callback('📩 Message User', `message_user_${ctx.from.id}`),
-        Markup.button.callback('👀 View User', `view_user_${ctx.from.id}`)
-      ]
-    ]);
-    
-    await notifyAdmins(notificationText, keyboard.reply_markup);
-    
-    // Forward screenshot to admins
-    const adminIds = process.env.ADMIN_IDS?.split(',') || [];
-    for (const adminId of adminIds) {
-      try {
-        await ctx.telegram.forwardMessage(adminId, ctx.from.id, ctx.message.message_id);
-      } catch (error) {
-        console.error(`Failed to forward screenshot to admin ${adminId}:`, error);
-      }
-    }
-    
-    await ctx.reply(
-      `✅ *Payment Screenshot Received!*\n\n` +
-      `Admins have been notified and will verify your payment shortly.\n` +
-      `Payment ID: \`${paymentId}\`\n\n` +
-      `You will receive a notification once verified.`
-    );
-  } catch (error) {
-    console.error('Error processing payment screenshot:', error);
-    await ctx.reply('❌ Error processing payment screenshot. Please try again.');
-  }
-});
-
-// ==================== WITHDRAWAL INPUT HANDLER ====================
-bot.on('text', async (ctx) => {
-  if (ctx.session.waitingForWithdrawal) {
-    const input = ctx.message.text.trim();
-    const [amount, paymentMethod, accountNumber] = input.split('|');
-    
-    if (!amount || !paymentMethod || !accountNumber) {
-      return ctx.reply('❌ Invalid format. Please use: Amount|PaymentMethod|AccountNumber');
-    }
-    
-    const numericAmount = parseInt(amount);
-    const user = users.get(ctx.from.id);
-    
-    if (isNaN(numericAmount) || numericAmount < CONFIG.WITHDRAWAL.MIN_AMOUNT) {
-      return ctx.reply(`❌ Amount must be at least ${CONFIG.WITHDRAWAL.MIN_AMOUNT} ETB`);
-    }
-    
-    if (numericAmount > user.balance) {
-      return ctx.reply(`❌ Amount exceeds your available balance of ${user.balance} ETB`);
-    }
-    
-    // Check if payment method is valid
-    if (!botSettings.payment_methods[paymentMethod.toLowerCase()] || !botSettings.payment_methods[paymentMethod.toLowerCase()].active) {
-      return ctx.reply(`❌ Invalid payment method. Available: ${Object.keys(botSettings.payment_methods).filter(m => botSettings.payment_methods[m].active).join(', ')}`);
-    }
-    
-    try {
-      const withdrawalId = `WD_${ctx.from.id}_${Date.now()}`;
-      const withdrawalData = {
-        withdrawalId: withdrawalId,
-        userId: ctx.from.id,
-        amount: numericAmount,
-        paymentMethod: paymentMethod.toLowerCase(),
-        accountNumber: accountNumber.trim(),
-        status: CONFIG.WITHDRAWAL.STATUS.PENDING,
-        requestedAt: new Date().toISOString()
-      };
-      
-      withdrawals.set(withdrawalId, withdrawalData);
-      
-      // Notify admins
-      const notificationText = `💰 *NEW WITHDRAWAL REQUEST*\n\n` +
-        `👤 User: ${user.firstName} ${user.lastName || ''}\n` +
-        `📱 Username: @${user.username || 'N/A'}\n` +
-        `🆔 User ID: ${ctx.from.id}\n` +
-        `💵 Amount: ${numericAmount} ETB\n` +
-        `📊 Paid Referrals: ${user.paidReferrals}\n` +
-        `💰 Current Balance: ${user.balance} ETB\n` +
-        `💳 Method: ${paymentMethod}\n` +
-        `🔢 Account: ${accountNumber}\n` +
-        `🆔 Withdrawal ID: ${withdrawalId}\n\n` +
-        `*Quick Actions:*`;
-      
-      const keyboard = Markup.inlineKeyboard([
-        [
-          Markup.button.callback('✅ Approve', `approve_withdrawal_${withdrawalId}`),
-          Markup.button.callback('❌ Reject', `reject_withdrawal_${withdrawalId}`)
-        ],
-        [
-          Markup.button.callback('📩 Message User', `message_user_${ctx.from.id}`),
-          Markup.button.callback('👀 View Details', `view_withdrawal_${withdrawalId}`)
-        ]
-      ]);
-      
-      await notifyAdmins(notificationText, keyboard.reply_markup);
-      
-      await ctx.reply(
-        `✅ *Withdrawal Request Submitted!*\n\n` +
-        `Amount: *${numericAmount} ETB*\n` +
-        `Method: *${paymentMethod}*\n` +
-        `Account: *${accountNumber}*\n` +
-        `Withdrawal ID: \`${withdrawalId}\`\n\n` +
-        `Admins have been notified. You will receive an update soon.`
-      );
-      
-      ctx.session.waitingForWithdrawal = false;
-    } catch (error) {
-      console.error('Error processing withdrawal:', error);
-      await ctx.reply('❌ Error processing withdrawal request. Please try again.');
-    }
-  }
-});
-
-// ==================== PAYMENT APPROVAL HANDLER ====================
-bot.action(/approve_payment_(.+)/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.answerCbQuery('❌ Access denied.');
-  }
-  
-  const paymentId = ctx.match[1];
-  const payment = payments.get(paymentId);
-  
-  if (!payment) {
-    return ctx.answerCbQuery('❌ Payment not found.');
-  }
-  
-  try {
-    // Update payment status
-    payments.set(paymentId, {
-      ...payment,
-      status: CONFIG.PAYMENT.STATUS.APPROVED,
-      verifiedBy: ctx.from.username,
-      verifiedAt: new Date().toISOString()
-    });
-    
-    // Update user balance and referral stats
-    const user = users.get(payment.userId);
-    if (user) {
-      const newBalance = user.balance + CONFIG.WITHDRAWAL.COMMISSION_PER_REFERRAL;
-      
-      users.set(payment.userId, {
-        ...user,
-        paidReferrals: user.paidReferrals + 1,
-        unpaidReferrals: Math.max(0, user.unpaidReferrals - 1),
-        balance: newBalance,
-        totalEarned: user.totalEarned + CONFIG.WITHDRAWAL.COMMISSION_PER_REFERRAL
-      });
-      
-      // Update referral status if exists
-      const referralKey = Array.from(referrals.entries())
-        .find(([key, ref]) => ref.referredUserId === payment.userId && ref.status === 'pending')?.[0];
-      
-      if (referralKey) {
-        referrals.set(referralKey, {
-          ...referrals.get(referralKey),
-          status: 'paid'
-        });
-      }
-      
-      // Notify user
-      await ctx.telegram.sendMessage(
-        payment.userId,
-        `🎉 *PAYMENT APPROVED!*\n\n` +
-        `Your payment has been verified successfully!\n` +
-        `You earned *${CONFIG.WITHDRAWAL.COMMISSION_PER_REFERRAL} ETB* from this payment.\n\n` +
-        `💰 New Balance: *${newBalance} ETB*\n` +
-        `✅ Paid Referrals: *${user.paidReferrals + 1}*`
-      );
-    }
-    
-    await ctx.editMessageText(`✅ Payment ${paymentId} approved successfully!`);
-    await ctx.answerCbQuery('Payment approved!');
-  } catch (error) {
-    console.error('Error approving payment:', error);
-    await ctx.answerCbQuery('❌ Error approving payment.');
-  }
-});
-
-// ==================== WITHDRAWAL APPROVAL HANDLER ====================
-bot.action(/approve_withdrawal_(.+)/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.answerCbQuery('❌ Access denied.');
-  }
-  
-  const withdrawalId = ctx.match[1];
-  const withdrawal = withdrawals.get(withdrawalId);
-  
-  if (!withdrawal) {
-    return ctx.answerCbQuery('❌ Withdrawal not found.');
-  }
-  
-  try {
-    // Update withdrawal status
-    withdrawals.set(withdrawalId, {
-      ...withdrawal,
-      status: CONFIG.WITHDRAWAL.STATUS.APPROVED,
-      processedBy: ctx.from.username,
-      processedAt: new Date().toISOString()
-    });
-    
-    // Update user balance
-    const user = users.get(withdrawal.userId);
-    if (user) {
-      const newBalance = user.balance - withdrawal.amount;
-      
-      users.set(withdrawal.userId, {
-        ...user,
-        balance: newBalance,
-        totalWithdrawn: user.totalWithdrawn + withdrawal.amount
-      });
-      
-      // Notify user
-      await ctx.telegram.sendMessage(
-        withdrawal.userId,
-        `🎉 *WITHDRAWAL APPROVED!*\n\n` +
-        `Your withdrawal of *${withdrawal.amount} ETB* has been approved!\n` +
-        `Funds will be sent to your ${withdrawal.paymentMethod} account.\n\n` +
-        `💵 Withdrawn: *${withdrawal.amount} ETB*\n` +
-        `💰 New Balance: *${newBalance} ETB*\n` +
-        `💳 Method: ${withdrawal.paymentMethod}\n` +
-        `🔢 Account: ${withdrawal.accountNumber}`
-      );
-    }
-    
-    await ctx.editMessageText(`✅ Withdrawal ${withdrawalId} approved successfully!`);
-    await ctx.answerCbQuery('Withdrawal approved!');
-  } catch (error) {
-    console.error('Error approving withdrawal:', error);
-    await ctx.answerCbQuery('❌ Error approving withdrawal.');
-  }
-});
-
-// ==================== PAYMENT REJECTION HANDLER ====================
-bot.action(/reject_payment_(.+)/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.answerCbQuery('❌ Access denied.');
-  }
-  
-  const paymentId = ctx.match[1];
-  const payment = payments.get(paymentId);
-  
-  if (!payment) {
-    return ctx.answerCbQuery('❌ Payment not found.');
-  }
-  
-  // Ask for rejection reason
-  await ctx.editMessageText(
-    `❌ Rejecting payment ${paymentId}\n\n` +
-    `Please send the rejection reason:`
-  );
-  
-  ctx.session.rejectingPayment = paymentId;
-  ctx.session.rejectingPaymentType = 'payment';
-});
-
-// ==================== WITHDRAWAL REJECTION HANDLER ====================
-bot.action(/reject_withdrawal_(.+)/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.answerCbQuery('❌ Access denied.');
-  }
-  
-  const withdrawalId = ctx.match[1];
-  const withdrawal = withdrawals.get(withdrawalId);
-  
-  if (!withdrawal) {
-    return ctx.answerCbQuery('❌ Withdrawal not found.');
-  }
-  
-  // Ask for rejection reason
-  await ctx.editMessageText(
-    `❌ Rejecting withdrawal ${withdrawalId}\n\n` +
-    `Please send the rejection reason:`
-  );
-  
-  ctx.session.rejectingPayment = withdrawalId;
-  ctx.session.rejectingPaymentType = 'withdrawal';
-});
-
-// ==================== REJECTION REASON HANDLER ====================
-bot.on('text', async (ctx) => {
-  if (ctx.session.rejectingPayment) {
-    const reason = ctx.message.text;
-    const paymentId = ctx.session.rejectingPayment;
-    const type = ctx.session.rejectingPaymentType;
-    
-    if (type === 'payment') {
-      const payment = payments.get(paymentId);
-      if (payment) {
-        payments.set(paymentId, {
-          ...payment,
-          status: CONFIG.PAYMENT.STATUS.REJECTED,
-          rejectionReason: reason,
-          verifiedBy: ctx.from.username,
-          verifiedAt: new Date().toISOString()
-        });
-        
-        // Notify user
-        await ctx.telegram.sendMessage(
-          payment.userId,
-          `❌ *PAYMENT REJECTED*\n\n` +
-          `Your payment has been rejected.\n\n` +
-          `Reason: ${reason}\n\n` +
-          `Please submit a valid payment screenshot.`
-        );
-      }
-      
-      await ctx.reply(`✅ Payment ${paymentId} rejected with reason.`);
-      
-    } else if (type === 'withdrawal') {
-      const withdrawal = withdrawals.get(paymentId);
-      if (withdrawal) {
-        withdrawals.set(paymentId, {
-          ...withdrawal,
-          status: CONFIG.WITHDRAWAL.STATUS.REJECTED,
-          rejectionReason: reason,
-          processedBy: ctx.from.username,
-          processedAt: new Date().toISOString()
-        });
-        
-        // Notify user
-        await ctx.telegram.sendMessage(
-          withdrawal.userId,
-          `❌ *WITHDRAWAL REJECTED*\n\n` +
-          `Your withdrawal request has been rejected.\n\n` +
-          `Reason: ${reason}\n\n` +
-          `You can submit a new withdrawal request.`
-        );
-      }
-      
-      await ctx.reply(`✅ Withdrawal ${paymentId} rejected with reason.`);
-    }
-    
-    // Clear session
-    ctx.session.rejectingPayment = null;
-    ctx.session.rejectingPaymentType = null;
-  }
-});
-
-// ==================== CONTINUE TO PART 3 ====================
-// ==================== ADMIN DASHBOARD ====================
-bot.hears('🔧 Admin', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const stats = await getAdminStats();
-  
-  const adminText = `🔧 *Admin Dashboard*\n\n` +
-    `📊 *Statistics*\n` +
-    `👥 Total Users: ${stats.totalUsers}\n` +
-    `💰 Total Payments: ${stats.totalPayments}\n` +
-    `⏳ Pending Payments: ${stats.pendingPayments}\n` +
-    `💸 Pending Withdrawals: ${stats.pendingWithdrawals}\n` +
-    `📈 Total Revenue: ${stats.totalRevenue} ETB\n\n` +
-    `⚡ *Quick Actions*`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('📸 Pending Payments', 'admin_pending_payments'),
-      Markup.button.callback('💸 Pending Withdrawals', 'admin_pending_withdrawals')
-    ],
-    [
-      Markup.button.callback('👥 User Management', 'admin_user_management'),
-      Markup.button.callback('📊 Analytics', 'admin_analytics')
-    ],
-    [
-      Markup.button.callback('⚙️ Bot Settings', 'admin_bot_settings'),
-      Markup.button.callback('📢 Broadcast', 'admin_broadcast')
-    ],
-    [
-      Markup.button.callback('📤 Export Data', 'admin_export_data'),
-      Markup.button.callback('🔄 Refresh', 'admin_refresh')
-    ]
-  ]);
-  
-  await ctx.replyWithMarkdown(adminText, keyboard);
-});
-
-bot.command('admin', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const stats = await getAdminStats();
-  
-  const adminText = `🔧 *Admin Dashboard*\n\n` +
-    `📊 *Statistics*\n` +
-    `👥 Total Users: ${stats.totalUsers}\n` +
-    `💰 Total Payments: ${stats.totalPayments}\n` +
-    `⏳ Pending Payments: ${stats.pendingPayments}\n` +
-    `💸 Pending Withdrawals: ${stats.pendingWithdrawals}\n` +
-    `📈 Total Revenue: ${stats.totalRevenue} ETB\n\n` +
-    `⚡ *Quick Actions*`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('📸 Pending Payments', 'admin_pending_payments'),
-      Markup.button.callback('💸 Pending Withdrawals', 'admin_pending_withdrawals')
-    ],
-    [
-      Markup.button.callback('👥 User Management', 'admin_user_management'),
-      Markup.button.callback('📊 Analytics', 'admin_analytics')
-    ],
-    [
-      Markup.button.callback('⚙️ Bot Settings', 'admin_bot_settings'),
-      Markup.button.callback('📢 Broadcast', 'admin_broadcast')
-    ],
-    [
-      Markup.button.callback('📤 Export Data', 'admin_export_data'),
-      Markup.button.callback('🔄 Refresh', 'admin_refresh')
-    ]
-  ]);
-  
-  await ctx.replyWithMarkdown(adminText, keyboard);
-});
-
-// ==================== ADMIN STATS FUNCTION ====================
-async function getAdminStats() {
-  const totalUsers = users.size;
-  const totalPayments = Array.from(payments.values()).length;
-  const pendingPayments = Array.from(payments.values()).filter(p => p.status === CONFIG.PAYMENT.STATUS.PENDING).length;
-  const pendingWithdrawals = Array.from(withdrawals.values()).filter(w => w.status === CONFIG.WITHDRAWAL.STATUS.PENDING).length;
-  const totalRevenue = Array.from(payments.values())
-    .filter(p => p.status === CONFIG.PAYMENT.STATUS.APPROVED)
-    .reduce((sum, p) => sum + p.amount, 0);
-  
   return {
-    totalUsers,
-    totalPayments,
-    pendingPayments,
-    pendingWithdrawals,
-    totalRevenue
+    totalUsers: usersSnapshot.size,
+    pendingConfessions: pending,
+    approvedConfessions: approved,
+    rejectedConfessions: rejected
   };
 }
 
-// ==================== ADMIN PENDING PAYMENTS ====================
-bot.action('admin_pending_payments', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  const pendingPayments = Array.from(payments.values())
-    .filter(p => p.status === CONFIG.PAYMENT.STATUS.PENDING)
-    .slice(0, 10);
-  
-  if (pendingPayments.length === 0) {
-    return ctx.editMessageText('✅ No pending payments.');
+// ==================== MANAGE USERS ====================
+bot.action('manage_users', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
   }
   
-  await ctx.editMessageText(`📸 *Pending Payments (${pendingPayments.length})*\n\nSelect a payment to view:`);
+  const usersSnapshot = await db.collection('users').limit(10).get();
   
-  for (const payment of pendingPayments) {
-    const user = users.get(payment.userId);
-    const paymentText = `📸 *Pending Payment*\n\n` +
-      `👤 User: ${user?.firstName || 'Unknown'}\n` +
-      `📱 Username: @${user?.username || 'N/A'}\n` +
-      `💰 Amount: ${payment.amount} ETB\n` +
-      `🆔 Payment ID: ${payment.paymentId}\n` +
-      `📅 Submitted: ${new Date(payment.submittedAt).toLocaleString()}`;
+  if (usersSnapshot.empty) {
+    await ctx.editMessageText(
+      `👥 *Manage Users*\n\nNo users found.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  let usersText = `👥 *Manage Users*\n\n`;
+  const keyboard = [];
+  
+  for (const doc of usersSnapshot.docs) {
+    const userData = doc.data();
+    const username = userData.username || 'No username';
+    const joinDate = new Date(userData.joinDate).toLocaleDateString();
+    const confessions = userData.totalConfessions || 0;
+    const reputation = userData.reputation || 0;
+    const status = userData.isActive ? '✅ Active' : '❌ Blocked';
     
-    const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback('✅ Approve', `approve_payment_${payment.paymentId}`),
-        Markup.button.callback('❌ Reject', `reject_payment_${payment.paymentId}`)
-      ],
-      [
-        Markup.button.callback('📩 Message User', `message_user_${payment.userId}`),
-        Markup.button.callback('👀 View User', `view_user_${payment.userId}`)
-      ]
+    usersText += `• ID: ${userData.userId}\n`;
+    usersText += `  Username: @${username}\n`;
+    usersText += `  Confessions: ${confessions}\n`;
+    usersText += `  Reputation: ${reputation}\n`;
+    usersText += `  Status: ${status}\n`;
+    usersText += `  Joined: ${joinDate}\n\n`;
+    
+    keyboard.push([
+      Markup.button.callback(`🔍 View @${username}`, `view_user_${userData.userId}`)
     ]);
-    
-    await ctx.replyWithMarkdown(paymentText, keyboard);
-    
-    // Forward screenshot
-    try {
-      await ctx.telegram.forwardMessage(ctx.from.id, payment.userId, payment.screenshotFileId);
-    } catch (error) {
-      console.error('Error forwarding screenshot:', error);
-    }
-  }
-});
-
-// ==================== ADMIN PENDING WITHDRAWALS ====================
-bot.action('admin_pending_withdrawals', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  const pendingWithdrawals = Array.from(withdrawals.values())
-    .filter(w => w.status === CONFIG.WITHDRAWAL.STATUS.PENDING)
-    .slice(0, 10);
-  
-  if (pendingWithdrawals.length === 0) {
-    return ctx.editMessageText('✅ No pending withdrawals.');
   }
   
-  await ctx.editMessageText(`💸 *Pending Withdrawals (${pendingWithdrawals.length})*\n\nSelect a withdrawal to process:`);
+  keyboard.push([Markup.button.callback('🔙 Admin Menu', 'admin_menu')]);
   
-  for (const withdrawal of pendingWithdrawals) {
-    const user = users.get(withdrawal.userId);
-    const withdrawalText = `💸 *Pending Withdrawal*\n\n` +
-      `👤 User: ${user?.firstName || 'Unknown'}\n` +
-      `📱 Username: @${user?.username || 'N/A'}\n` +
-      `💵 Amount: ${withdrawal.amount} ETB\n` +
-      `💳 Method: ${withdrawal.paymentMethod}\n` +
-      `🔢 Account: ${withdrawal.accountNumber}\n` +
-      `📊 Paid Referrals: ${user?.paidReferrals || 0}\n` +
-      `💰 User Balance: ${user?.balance || 0} ETB\n` +
-      `🆔 Withdrawal ID: ${withdrawal.withdrawalId}`;
-    
-    const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback('✅ Approve', `approve_withdrawal_${withdrawal.withdrawalId}`),
-        Markup.button.callback('❌ Reject', `reject_withdrawal_${withdrawal.withdrawalId}`)
-      ],
-      [
-        Markup.button.callback('📩 Message User', `message_user_${withdrawal.userId}`),
-        Markup.button.callback('👀 View User', `view_user_${withdrawal.userId}`)
-      ]
-    ]);
-    
-    await ctx.replyWithMarkdown(withdrawalText, keyboard);
+  await ctx.editMessageText(usersText, { 
+    parse_mode: 'Markdown',
+    reply_markup: Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// View user details
+bot.action(/view_user_(.+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
   }
-});
-
-// ==================== ADMIN USER MANAGEMENT ====================
-bot.action('admin_user_management', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  const userManagementText = `👥 *User Management*\n\n` +
-    `Total Users: ${users.size}\n` +
-    `Active Users: ${Array.from(users.values()).filter(u => u.status === CONFIG.USER.STATUS.ACTIVE).length}\n` +
-    `Blocked Users: ${Array.from(users.values()).filter(u => u.status === CONFIG.USER.STATUS.BLOCKED).length}\n\n` +
-    `*User Actions:*`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('🔍 Search User', 'admin_search_user'),
-      Markup.button.callback('📋 List Users', 'admin_list_users')
-    ],
-    [
-      Markup.button.callback('🚫 Block User', 'admin_block_user'),
-      Markup.button.callback('✅ Unblock User', 'admin_unblock_user')
-    ],
-    [
-      Markup.button.callback('✏️ Edit User', 'admin_edit_user'),
-      Markup.button.callback('📊 User Stats', 'admin_user_stats')
-    ],
-    [
-      Markup.button.callback('🔙 Back', 'admin_back')
-    ]
-  ]);
-  
-  await ctx.editMessageText(userManagementText, keyboard);
-});
-
-// ==================== ADMIN BOT SETTINGS ====================
-bot.action('admin_bot_settings', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  const settingsText = `⚙️ *Bot Settings*\n\n` +
-    `🤖 Bot Status: ${botSettings.status === CONFIG.BOT.STATUS.ACTIVE ? '🟢 ACTIVE' : '🔴 MAINTENANCE'}\n\n` +
-    `🔧 *Feature Toggles:*\n` +
-    `📝 Registration: ${botSettings.features.registration ? '🟢 ON' : '🔴 OFF'}\n` +
-    `📸 Screenshots: ${botSettings.features.screenshot_upload ? '🟢 ON' : '🔴 OFF'}\n` +
-    `💰 Payments: ${botSettings.features.payments ? '🟢 ON' : '🔴 OFF'}\n` +
-    `👥 Referrals: ${botSettings.features.referrals ? '🟢 ON' : '🔴 OFF'}\n` +
-    `💸 Withdrawals: ${botSettings.features.withdrawals ? '🟢 ON' : '🔴 OFF'}\n\n` +
-    `*Settings Actions:*`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback(botSettings.status === CONFIG.BOT.STATUS.ACTIVE ? '🔴 Maintenance Mode' : '🟢 Activate Bot', 'admin_toggle_bot_status'),
-      Markup.button.callback('📝 Edit Welcome Message', 'admin_edit_welcome')
-    ],
-    [
-      Markup.button.callback('💳 Payment Methods', 'admin_payment_methods'),
-      Markup.button.callback('💰 Referral Commission', 'admin_referral_commission')
-    ],
-    [
-      Markup.button.callback('🔄 Toggle All Features', 'admin_toggle_all_features'),
-      Markup.button.callback('📊 Feature Settings', 'admin_feature_settings')
-    ],
-    [
-      Markup.button.callback('🔙 Back', 'admin_back')
-    ]
-  ]);
-  
-  await ctx.editMessageText(settingsText, keyboard);
-});
-
-// ==================== ADMIN BROADCAST SYSTEM ====================
-bot.action('admin_broadcast', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  const broadcastText = `📢 *Broadcast Message*\n\n` +
-    `Send a message to all ${users.size} users.\n\n` +
-    `*Options:*\n` +
-    `• Text announcements\n` +
-    `• Important updates\n` +
-    `• Promotional messages\n\n` +
-    `Choose broadcast type:`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('📝 Text Broadcast', 'admin_broadcast_text'),
-      Markup.button.callback('🖼️ Photo Broadcast', 'admin_broadcast_photo')
-    ],
-    [
-      Markup.button.callback('👥 Preview Users', 'admin_broadcast_preview'),
-      Markup.button.callback('📊 Broadcast Stats', 'admin_broadcast_stats')
-    ],
-    [
-      Markup.button.callback('🔙 Back', 'admin_back')
-    ]
-  ]);
-  
-  await ctx.editMessageText(broadcastText, keyboard);
-});
-
-// ==================== ADMIN EXPORT DATA ====================
-bot.action('admin_export_data', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  const exportText = `📤 *Export Data*\n\n` +
-    `Export user and payment data for analysis.\n\n` +
-    `*Available Exports:*`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('👥 All Users', 'admin_export_all_users'),
-      Markup.button.callback('✅ Paid Users', 'admin_export_paid_users')
-    ],
-    [
-      Markup.button.callback('⏳ Unpaid Users', 'admin_export_unpaid_users'),
-      Markup.button.callback('💰 Payments', 'admin_export_payments')
-    ],
-    [
-      Markup.button.callback('💸 Withdrawals', 'admin_export_withdrawals'),
-      Markup.button.callback('📊 Full Report', 'admin_export_full')
-    ],
-    [
-      Markup.button.callback('🔙 Back', 'admin_back')
-    ]
-  ]);
-  
-  await ctx.editMessageText(exportText, keyboard);
-});
-
-// ==================== ADMIN EXPORT HANDLERS ====================
-bot.action('admin_export_all_users', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  await ctx.answerCbQuery('⏳ Generating CSV file...');
-  
-  try {
-    const usersArray = Array.from(users.values());
-    let csv = 'User ID,Name,Username,Phone,Balance,Paid Referrals,Total Referrals,Status,Registration Date\n';
-    
-    usersArray.forEach(user => {
-      csv += `${user.telegramId},"${user.firstName} ${user.lastName || ''}","${user.username || 'N/A'}","${user.phone || 'N/A'}",${user.balance},${user.paidReferrals},${user.totalReferrals},${user.status},"${user.registrationDate}"\n`;
-    });
-    
-    const filename = `all_users_${new Date().toISOString().split('T')[0]}.csv`;
-    
-    await ctx.replyWithDocument({
-      source: Buffer.from(csv, 'utf8'),
-      filename: filename
-    }, {
-      caption: `📊 Exported: ${filename}\nTotal Users: ${usersArray.length}\nGenerated: ${new Date().toLocaleString()}`
-    });
-    
-  } catch (error) {
-    await ctx.reply('❌ Error generating export file.');
-    console.error('Export error:', error);
-  }
-});
-
-// ==================== ADMIN BACK BUTTON ====================
-bot.action('admin_back', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  const stats = await getAdminStats();
-  
-  const adminText = `🔧 *Admin Dashboard*\n\n` +
-    `📊 *Statistics*\n` +
-    `👥 Total Users: ${stats.totalUsers}\n` +
-    `💰 Total Payments: ${stats.totalPayments}\n` +
-    `⏳ Pending Payments: ${stats.pendingPayments}\n` +
-    `💸 Pending Withdrawals: ${stats.pendingWithdrawals}\n` +
-    `📈 Total Revenue: ${stats.totalRevenue} ETB\n\n` +
-    `⚡ *Quick Actions*`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('📸 Pending Payments', 'admin_pending_payments'),
-      Markup.button.callback('💸 Pending Withdrawals', 'admin_pending_withdrawals')
-    ],
-    [
-      Markup.button.callback('👥 User Management', 'admin_user_management'),
-      Markup.button.callback('📊 Analytics', 'admin_analytics')
-    ],
-    [
-      Markup.button.callback('⚙️ Bot Settings', 'admin_bot_settings'),
-      Markup.button.callback('📢 Broadcast', 'admin_broadcast')
-    ],
-    [
-      Markup.button.callback('📤 Export Data', 'admin_export_data'),
-      Markup.button.callback('🔄 Refresh', 'admin_refresh')
-    ]
-  ]);
-  
-  await ctx.editMessageText(adminText, keyboard);
-});
-
-// ==================== ADMIN REFRESH ====================
-bot.action('admin_refresh', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  await ctx.answerCbQuery('🔄 Refreshing...');
-  
-  const stats = await getAdminStats();
-  
-  const adminText = `🔧 *Admin Dashboard*\n\n` +
-    `📊 *Statistics*\n` +
-    `👥 Total Users: ${stats.totalUsers}\n` +
-    `💰 Total Payments: ${stats.totalPayments}\n` +
-    `⏳ Pending Payments: ${stats.pendingPayments}\n` +
-    `💸 Pending Withdrawals: ${stats.pendingWithdrawals}\n` +
-    `📈 Total Revenue: ${stats.totalRevenue} ETB\n\n` +
-    `⚡ *Quick Actions*`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('📸 Pending Payments', 'admin_pending_payments'),
-      Markup.button.callback('💸 Pending Withdrawals', 'admin_pending_withdrawals')
-    ],
-    [
-      Markup.button.callback('👥 User Management', 'admin_user_management'),
-      Markup.button.callback('📊 Analytics', 'admin_analytics')
-    ],
-    [
-      Markup.button.callback('⚙️ Bot Settings', 'admin_bot_settings'),
-      Markup.button.callback('📢 Broadcast', 'admin_broadcast')
-    ],
-    [
-      Markup.button.callback('📤 Export Data', 'admin_export_data'),
-      Markup.button.callback('🔄 Refresh', 'admin_refresh')
-    ]
-  ]);
-  
-  await ctx.editMessageText(adminText, keyboard);
-});
-
-// ==================== MESSAGE USER HANDLER ====================
-bot.action(/message_user_(.+)/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
   
   const userId = ctx.match[1];
-  const user = users.get(userId);
+  const profile = await getUserProfile(userId);
   
-  if (!user) {
-    return ctx.answerCbQuery('❌ User not found.');
+  const text = `👤 *User Details*\n\n`;
+  const id = `**User ID:** ${profile.userId}\n`;
+  const username = profile.username ? `**Username:** @${profile.username}\n` : '';
+  const bio = profile.bio ? `**Bio:** ${profile.bio}\n` : '';
+  const followers = `**Followers:** ${profile.followers.length}\n`;
+  const following = `**Following:** ${profile.following.length}\n`;
+  const confessions = `**Confessions:** ${profile.totalConfessions}\n`;
+  const reputation = `**Reputation:** ${profile.reputation}\n`;
+  const achievements = `**Achievements:** ${profile.achievementCount}\n`;
+  const streak = `**Daily Streak:** ${profile.dailyStreak} days\n`;
+  const status = `**Status:** ${profile.isActive ? '✅ Active' : '❌ Blocked'}\n`;
+  const joinDate = `**Join Date:** ${new Date(profile.joinDate).toLocaleDateString()}\n`;
+  
+  const fullText = text + id + username + bio + followers + following + confessions + reputation + achievements + streak + status + joinDate;
+  
+  const keyboard = [
+    [Markup.button.callback('✉️ Message User', `message_${userId}`)],
+    [Markup.button.callback(profile.isActive ? '❌ Block User' : '✅ Unblock User', `toggle_block_${userId}`)],
+    [Markup.button.callback('👥 View Confessions', `view_user_confessions_${userId}`)],
+    [Markup.button.callback('🔙 Back to Users', 'manage_users')]
+  ];
+  
+  await ctx.editMessageText(fullText, { 
+    parse_mode: 'Markdown',
+    reply_markup: Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// Toggle user block status
+bot.action(/toggle_block_(.+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  const userId = ctx.match[1];
+  const profile = await getUserProfile(userId);
+  
+  await db.collection('users').doc(userId.toString()).update({
+    isActive: !profile.isActive
+  });
+  
+  await ctx.answerCbQuery(profile.isActive ? '❌ User blocked!' : '✅ User unblocked!');
+  
+  // Update the message
+  const updatedProfile = await getUserProfile(userId);
+  const text = `👤 *User Details*\n\n`;
+  const id = `**User ID:** ${updatedProfile.userId}\n`;
+  const username = updatedProfile.username ? `**Username:** @${updatedProfile.username}\n` : '';
+  const bio = updatedProfile.bio ? `**Bio:** ${updatedProfile.bio}\n` : '';
+  const followers = `**Followers:** ${updatedProfile.followers.length}\n`;
+  const following = `**Following:** ${updatedProfile.following.length}\n`;
+  const confessions = `**Confessions:** ${updatedProfile.totalConfessions}\n`;
+  const reputation = `**Reputation:** ${updatedProfile.reputation}\n`;
+  const achievements = `**Achievements:** ${updatedProfile.achievementCount}\n`;
+  const streak = `**Daily Streak:** ${updatedProfile.dailyStreak} days\n`;
+  const status = `**Status:** ${updatedProfile.isActive ? '✅ Active' : '❌ Blocked'}\n`;
+  const joinDate = `**Join Date:** ${new Date(updatedProfile.joinDate).toLocaleDateString()}\n`;
+  
+  const fullText = text + id + username + bio + followers + following + confessions + reputation + achievements + streak + status + joinDate;
+  
+  const keyboard = [
+    [Markup.button.callback('✉️ Message User', `message_${userId}`)],
+    [Markup.button.callback(updatedProfile.isActive ? '❌ Block User' : '✅ Unblock User', `toggle_block_${userId}`)],
+    [Markup.button.callback('👥 View Confessions', `view_user_confessions_${userId}`)],
+    [Markup.button.callback('🔙 Back to User', `view_user_${userId}`)]
+  ];
+  
+  await ctx.editMessageText(fullText, { 
+    parse_mode: 'Markdown',
+    reply_markup: Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// View user confessions
+bot.action(/view_user_confessions_(.+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  const userId = ctx.match[1];
+  
+  const confessionsSnapshot = await db.collection('confessions')
+    .where('userId', '==', parseInt(userId))
+    .orderBy('createdAt', 'desc')
+    .limit(10)
+    .get();
+  
+  if (confessionsSnapshot.empty) {
+    await ctx.editMessageText(
+      `📝 *User Confessions*\n\nNo confessions found for this user.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  let confessionsText = `📝 *User Confessions*\n\n`;
+  const keyboard = [];
+  
+  for (const doc of confessionsSnapshot.docs) {
+    const data = doc.data();
+    const status = data.status.charAt(0).toUpperCase() + data.status.slice(1);
+    const createdAt = new Date(data.createdAt).toLocaleDateString();
+    
+    confessionsText += `• #${data.confessionNumber || 'N/A'} - ${status}\n`;
+    confessionsText += `  Created: ${createdAt}\n`;
+    confessionsText += `  "${data.text.substring(0, 50)}${data.text.length > 50 ? '...' : ''}"\n\n`;
+    
+    keyboard.push([
+      Markup.button.callback(`🔍 View Confession #${data.confessionNumber || 'N/A'}`, `view_confession_${data.confessionId}`)
+    ]);
+  }
+  
+  keyboard.push([Markup.button.callback('🔙 Back to User', `view_user_${userId}`)]);
+  
+  await ctx.editMessageText(confessionsText, { 
+    parse_mode: 'Markdown',
+    reply_markup: Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// ==================== REVIEW CONFESSIONS ====================
+bot.action('review_confessions', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  const pendingSnapshot = await db.collection('confessions')
+    .where('status', '==', 'pending')
+    .orderBy('createdAt', 'asc')
+    .limit(10)
+    .get();
+  
+  if (pendingSnapshot.empty) {
+    await ctx.editMessageText(
+      `📝 *Pending Confessions*\n\nNo pending confessions to review.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  let confessionsText = `📝 *Pending Confessions*\n\n`;
+  const keyboard = [];
+  
+  for (const doc of pendingSnapshot.docs) {
+    const data = doc.data();
+    const user = await getUserProfile(data.userId);
+    const username = user.username ? `@${user.username}` : `ID: ${data.userId}`;
+    
+    confessionsText += `• From: ${username}\n`;
+    confessionsText += `  Confession: "${data.text.substring(0, 50)}${data.text.length > 50 ? '...' : ''}"\n\n`;
+    
+    keyboard.push([
+      Markup.button.callback(`✅ Approve #${doc.id}`, `approve_${doc.id}`),
+      Markup.button.callback(`❌ Reject #${doc.id}`, `reject_${doc.id}`)
+    ]);
+  }
+  
+  keyboard.push([Markup.button.callback('🔙 Admin Menu', 'admin_menu')]);
+  
+  await ctx.editMessageText(confessionsText, { 
+    parse_mode: 'Markdown',
+    reply_markup: Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// ==================== BROADCAST MESSAGE ====================
+bot.action('broadcast_message', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
   }
   
   await ctx.editMessageText(
-    `📩 Message User: ${user.firstName} (@${user.username || 'N/A'})\n\n` +
-    `Please type your message:`
+    `📢 *Broadcast Message*\n\nEnter your message to broadcast to all users:`,
+    { parse_mode: 'Markdown' }
   );
-  
-  ctx.session.messagingUser = userId;
+  ctx.session.waitingForBroadcast = true;
+  await ctx.answerCbQuery();
 });
 
-// ==================== VIEW USER HANDLER ====================
-bot.action(/view_user_(.+)/, async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  
-  const userId = ctx.match[1];
-  const user = users.get(userId);
-  
-  if (!user) {
-    return ctx.answerCbQuery('❌ User not found.');
+bot.on('text', async (ctx) => {
+  // Handle confession submission
+  if (ctx.session.waitingForConfession) {
+    await handleConfession(ctx, ctx.message.text);
+    return;
   }
   
-  const userLevel = getUserLevel(user.paidReferrals);
-  const userText = `👤 *User Profile*\n\n` +
-    `🆔 User ID: ${user.telegramId}\n` +
-    `👤 Name: ${user.firstName} ${user.lastName || ''}\n` +
-    `📱 Username: @${user.username || 'N/A'}\n` +
-    `📞 Phone: ${user.phone || 'N/A'}\n` +
-    `🎖️ Level: ${userLevel.title}\n` +
-    `📊 Status: ${user.status}\n\n` +
-    `💰 *Financial Info*\n` +
-    `💵 Balance: ${user.balance} ETB\n` +
-    `📈 Total Earned: ${user.totalEarned} ETB\n` +
-    `📉 Total Withdrawn: ${user.totalWithdrawn} ETB\n\n` +
-    `👥 *Referral Stats*\n` +
-    `✅ Paid Referrals: ${user.paidReferrals}\n` +
-    `⏳ Unpaid Referrals: ${user.unpaidReferrals}\n` +
-    `📊 Total Referrals: ${user.totalReferrals}\n\n` +
-    `📅 Registered: ${new Date(user.registrationDate).toLocaleString()}\n` +
-    `⏰ Last Seen: ${new Date(user.lastSeen).toLocaleString()}`;
+  // Handle rejection reason
+  if (ctx.session.rejectingConfession) {
+    await handleRejection(ctx, ctx.message.text);
+    return;
+  }
   
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('📩 Message User', `message_user_${userId}`),
-      Markup.button.callback('✏️ Edit User', `admin_edit_user_${userId}`)
-    ],
-    [
-      Markup.button.callback(user.status === CONFIG.USER.STATUS.ACTIVE ? '🚫 Block User' : '✅ Unblock User', `admin_toggle_block_${userId}`),
-      Markup.button.callback('💰 Adjust Balance', `admin_adjust_balance_${userId}`)
-    ],
-    [
-      Markup.button.callback('🔙 Back', 'admin_user_management')
-    ]
-  ]);
-  
-  await ctx.editMessageText(userText, keyboard);
-});
-
-// ==================== ADMIN MESSAGE HANDLER ====================
-bot.on('text', async (ctx) => {
+  // Handle admin messages to users
   if (ctx.session.messagingUser) {
-    const userId = ctx.session.messagingUser;
-    const message = ctx.message.text;
-    const user = users.get(userId);
+    await handleAdminMessage(ctx, ctx.message.text);
+    return;
+  }
+  
+  // Handle comment submission
+  if (ctx.session.waitingForComment) {
+    await addComment(ctx, ctx.message.text);
+    return;
+  }
+  
+  // Handle username setting
+  if (ctx.session.waitingForUsername) {
+    const username = ctx.message.text.trim();
+    
+    // Validate username
+    if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) {
+      await ctx.reply('❌ Invalid username. Use 3-20 characters (letters, numbers, underscores only).');
+      return;
+    }
+    
+    // Check if username already exists
+    const existingUsers = await db.collection('users')
+      .where('username', '==', username)
+      .limit(1)
+      .get();
+    
+    if (!existingUsers.empty && existingUsers.docs[0].data().userId !== ctx.from.id) {
+      await ctx.reply('❌ Username already taken. Choose another one.');
+      return;
+    }
+    
+    // Update profile
+    await db.collection('users').doc(ctx.from.id.toString()).update({
+      username: username
+    });
+    
+    await ctx.reply(`✅ Username updated to @${username}`);
+    ctx.session.waitingForUsername = false;
+    return;
+  }
+  
+  // Handle bio setting
+  if (ctx.session.waitingForBio) {
+    const bio = ctx.message.text.trim();
+    
+    if (bio.length > 100) {
+      await ctx.reply('❌ Bio too long. Maximum 100 characters.');
+      return;
+    }
+    
+    await db.collection('users').doc(ctx.from.id.toString()).update({
+      bio: bio
+    });
+    
+    await ctx.reply('✅ Bio updated successfully!');
+    ctx.session.waitingForBio = false;
+    return;
+  }
+  
+  // Handle broadcast message
+  if (ctx.session.waitingForBroadcast) {
+    if (!isAdmin(ctx.from.id)) {
+      await ctx.reply('❌ Access denied');
+      ctx.session.waitingForBroadcast = false;
+      return;
+    }
+    
+    await broadcastMessage(ctx.message.text);
+    await ctx.reply('✅ Broadcast message sent to all users!');
+    ctx.session.waitingForBroadcast = false;
+    return;
+  }
+  
+  // Handle manual block
+  if (ctx.session.waitingForBlockUserId) {
+    if (!isAdmin(ctx.from.id)) {
+      await ctx.reply('❌ Access denied');
+      ctx.session.waitingForBlockUserId = false;
+      return;
+    }
+    
+    const userId = parseInt(ctx.message.text.trim());
+    if (isNaN(userId)) {
+      await ctx.reply('❌ Invalid user ID. Please enter a valid number.');
+      return;
+    }
     
     try {
-      await ctx.telegram.sendMessage(
-        userId,
-        `📩 *Message from Admin*\n\n${message}`
-      );
-      
-      await ctx.reply(`✅ Message sent to ${user.firstName} (@${user.username || 'N/A'})`);
-      
-      // Clear session
-      ctx.session.messagingUser = null;
+      await db.collection('users').doc(userId.toString()).update({
+        isActive: false
+      });
+      await ctx.reply(`✅ User ${userId} has been blocked.`);
     } catch (error) {
-      await ctx.reply(`❌ Failed to send message to user. They may have blocked the bot.`);
-      ctx.session.messagingUser = null;
+      await ctx.reply(`❌ Error blocking user: ${error.message}`);
     }
+    
+    ctx.session.waitingForBlockUserId = false;
+    return;
+  }
+  
+  // Handle manual unblock
+  if (ctx.session.waitingForUnblockUserId) {
+    if (!isAdmin(ctx.from.id)) {
+      await ctx.reply('❌ Access denied');
+      ctx.session.waitingForUnblockUserId = false;
+      return;
+    }
+    
+    const userId = parseInt(ctx.message.text.trim());
+    if (isNaN(userId)) {
+      await ctx.reply('❌ Invalid user ID. Please enter a valid number.');
+      return;
+    }
+    
+    try {
+      await db.collection('users').doc(userId.toString()).update({
+        isActive: true
+      });
+      await ctx.reply(`✅ User ${userId} has been unblocked.`);
+    } catch (error) {
+      await ctx.reply(`❌ Error unblocking user: ${error.message}`);
+    }
+    
+    ctx.session.waitingForUnblockUserId = false;
+    return;
   }
 });
 
-// ==================== HELP COMMAND ====================
-bot.help((ctx) => {
-  ctx.replyWithMarkdown(`
-🤖 *JU Registration Bot Help*
-
-*Main Commands:*
-/start - Start the bot
-/menu - Show main menu
-/balance - Check your balance & referrals
-/referrals - Get your referral link
-/leaderboard - See top users
-/withdraw - Request withdrawal
-
-*For Users:*
-• Send payment screenshot to submit payment
-• Share your referral link to earn money
-• Need 4 paid referrals to withdraw
-
-*For Admins:*
-/admin - Access admin dashboard
-
-*Support:*
-Contact admin if you need help.
-  `);
-});
-
-// ==================== ADMIN TEXT COMMANDS ====================
-
-// List all registered users
-bot.command('registered', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
+async function broadcastMessage(message) {
+  const usersSnapshot = await db.collection('users').get();
   
-  const usersArray = Array.from(users.values());
-  const activeUsers = usersArray.filter(u => u.status === CONFIG.USER.STATUS.ACTIVE);
-  const blockedUsers = usersArray.filter(u => u.status === CONFIG.USER.STATUS.BLOCKED);
-  
-  const statsText = `📊 *Registered Users*\n\n` +
-    `👥 Total Users: ${usersArray.length}\n` +
-    `✅ Active Users: ${activeUsers.length}\n` +
-    `🚫 Blocked Users: ${blockedUsers.length}\n` +
-    `📈 Paid Referrals Total: ${usersArray.reduce((sum, user) => sum + user.paidReferrals, 0)}\n` +
-    `💰 Total Balance: ${usersArray.reduce((sum, user) => sum + user.balance, 0)} ETB`;
-  
-  await ctx.replyWithMarkdown(statsText);
-});
-
-// List users command
-bot.command('users', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const usersArray = Array.from(users.values())
-    .sort((a, b) => new Date(b.registrationDate) - new Date(a.registrationDate))
-    .slice(0, 20);
-  
-  let usersText = `👥 *Recent Users (Last 20)*\n\n`;
-  
-  if (usersArray.length === 0) {
-    usersText += `No users registered yet.`;
-  } else {
-    usersArray.forEach((user, index) => {
-      usersText += `${index + 1}. ${user.firstName} (@${user.username || 'no_username'})\n` +
-        `   🆔: ${user.telegramId} | 💰: ${user.balance} ETB\n` +
-        `   ✅ ${user.paidReferrals} paid | 📊 ${user.totalReferrals} total\n` +
-        `   📅 ${new Date(user.registrationDate).toLocaleDateString()}\n\n`;
-    });
-  }
-  
-  await ctx.replyWithMarkdown(usersText);
-});
-
-// User profile command
-bot.command('user', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const userId = ctx.message.text.split(' ')[1];
-  if (!userId) {
-    return ctx.reply('Usage: /user <user_id>');
-  }
-  
-  const user = users.get(userId) || Array.from(users.values()).find(u => u.username === userId);
-  if (!user) {
-    return ctx.reply('❌ User not found.');
-  }
-  
-  const userLevel = getUserLevel(user.paidReferrals);
-  const userText = `👤 *User Profile*\n\n` +
-    `🆔 User ID: ${user.telegramId}\n` +
-    `👤 Name: ${user.firstName} ${user.lastName || ''}\n` +
-    `📱 Username: @${user.username || 'N/A'}\n` +
-    `🎖️ Level: ${userLevel.title}\n` +
-    `📊 Status: ${user.status}\n\n` +
-    `💰 Balance: ${user.balance} ETB\n` +
-    `📈 Total Earned: ${user.totalEarned} ETB\n` +
-    `📉 Total Withdrawn: ${user.totalWithdrawn} ETB\n\n` +
-    `👥 Referrals: ${user.paidReferrals} paid / ${user.unpaidReferrals} unpaid / ${user.totalReferrals} total\n\n` +
-    `📅 Registered: ${new Date(user.registrationDate).toLocaleString()}\n` +
-    `⏰ Last Seen: ${new Date(user.lastSeen).toLocaleString()}`;
-  
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('📩 Message', `message_user_${user.telegramId}`),
-      Markup.button.callback(user.status === CONFIG.USER.STATUS.ACTIVE ? '🚫 Block' : '✅ Unblock', `admin_toggle_block_${user.telegramId}`)
-    ],
-    [
-      Markup.button.callback('💰 Adjust Balance', `admin_adjust_balance_${user.telegramId}`),
-      Markup.button.callback('📊 Edit Referrals', `admin_edit_refs_${user.telegramId}`)
-    ]
-  ]);
-  
-  await ctx.replyWithMarkdown(userText, keyboard);
-});
-
-// Block user command
-bot.command('block', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const args = ctx.message.text.split(' ');
-  if (args.length < 2) {
-    return ctx.reply('Usage: /block <user_id>');
-  }
-  
-  const userId = args[1];
-  const user = users.get(userId);
-  
-  if (!user) {
-    return ctx.reply('❌ User not found.');
-  }
-  
-  users.set(userId, {
-    ...user,
-    status: CONFIG.USER.STATUS.BLOCKED,
-    blockReason: 'Manual block by admin',
-    blockedAt: new Date().toISOString()
-  });
-  
-  await ctx.reply(`✅ User ${user.firstName} (@${user.username || 'N/A'}) has been blocked.`);
-});
-
-// Unblock user command
-bot.command('unblock', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const args = ctx.message.text.split(' ');
-  if (args.length < 2) {
-    return ctx.reply('Usage: /unblock <user_id>');
-  }
-  
-  const userId = args[1];
-  const user = users.get(userId);
-  
-  if (!user) {
-    return ctx.reply('❌ User not found.');
-  }
-  
-  users.set(userId, {
-    ...user,
-    status: CONFIG.USER.STATUS.ACTIVE,
-    blockReason: null,
-    blockedAt: null
-  });
-  
-  await ctx.reply(`✅ User ${user.firstName} (@${user.username || 'N/A'}) has been unblocked.`);
-});
-
-// Payments command
-bot.command('payments', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const pendingPayments = Array.from(payments.values())
-    .filter(p => p.status === CONFIG.PAYMENT.STATUS.PENDING);
-  
-  if (pendingPayments.length === 0) {
-    return ctx.reply('✅ No pending payments.');
-  }
-  
-  let paymentsText = `📸 *Pending Payments (${pendingPayments.length})*\n\n`;
-  
-  pendingPayments.forEach((payment, index) => {
-    const user = users.get(payment.userId);
-    paymentsText += `${index + 1}. ${user?.firstName || 'Unknown'} (@${user?.username || 'N/A'})\n` +
-      `   💰 ${payment.amount} ETB | 🆔 ${payment.paymentId}\n` +
-      `   📅 ${new Date(payment.submittedAt).toLocaleString()}\n\n`;
-  });
-  
-  await ctx.replyWithMarkdown(paymentsText);
-});
-
-// Stats command
-bot.command('stats', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const stats = await getAdminStats();
-  const usersArray = Array.from(users.values());
-  
-  const topReferrers = usersArray
-    .filter(u => u.paidReferrals > 0)
-    .sort((a, b) => b.paidReferrals - a.paidReferrals)
-    .slice(0, 5);
-  
-  let statsText = `📊 *Bot Statistics*\n\n` +
-    `👥 Users: ${stats.totalUsers} total\n` +
-    `💰 Payments: ${stats.totalPayments} total | ${stats.pendingPayments} pending\n` +
-    `💸 Withdrawals: ${stats.pendingWithdrawals} pending\n` +
-    `📈 Revenue: ${stats.totalRevenue} ETB\n\n` +
-    `🏆 *Top Referrers:*\n`;
-  
-  if (topReferrers.length === 0) {
-    statsText += `No top referrers yet.\n`;
-  } else {
-    topReferrers.forEach((user, index) => {
-      statsText += `${index + 1}. ${user.firstName} - ${user.paidReferrals} paid referrals\n`;
-    });
-  }
-  
-  statsText += `\n⚙️ *Bot Status:* ${botSettings.status === CONFIG.BOT.STATUS.ACTIVE ? '🟢 ACTIVE' : '🔴 MAINTENANCE'}`;
-  
-  await ctx.replyWithMarkdown(statsText);
-});
-
-// Export users command
-bot.command('export_users', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const usersArray = Array.from(users.values());
-  let csv = 'User ID,Name,Username,Phone,Balance,Paid Referrals,Total Referrals,Status,Registration Date\n';
-  
-  usersArray.forEach(user => {
-    csv += `${user.telegramId},"${user.firstName} ${user.lastName || ''}","${user.username || 'N/A'}","${user.phone || 'N/A'}",${user.balance},${user.paidReferrals},${user.totalReferrals},${user.status},"${user.registrationDate}"\n`;
-  });
-  
-  const filename = `users_export_${new Date().toISOString().split('T')[0]}.csv`;
-  
-  await ctx.replyWithDocument({
-    source: Buffer.from(csv, 'utf8'),
-    filename: filename
-  }, {
-    caption: `📊 Exported: ${filename}\nTotal Users: ${usersArray.length}`
-  });
-});
-
-// Broadcast command
-bot.command('broadcast', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ Access denied. Admin only.');
-  }
-  
-  const message = ctx.message.text.replace('/broadcast', '').trim();
-  if (!message) {
-    return ctx.reply('Usage: /broadcast <your_message>');
-  }
-  
-  const usersArray = Array.from(users.values());
   let successCount = 0;
   let failCount = 0;
   
-  await ctx.reply(`📢 Starting broadcast to ${usersArray.length} users...`);
-  
-  for (const user of usersArray) {
-    try {
-      await ctx.telegram.sendMessage(
-        user.telegramId,
-        `📢 *ANNOUNCEMENT*\n\n${message}`
-      );
-      successCount++;
-      // Small delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 100));
-    } catch (error) {
-      failCount++;
+  for (const doc of usersSnapshot.docs) {
+    const userData = doc.data();
+    if (userData.isActive) { // Only send to active users
+      try {
+        await bot.telegram.sendMessage(userData.userId, `📢 *Broadcast Message*\n\n${message}`, {
+          parse_mode: 'Markdown'
+        });
+        successCount++;
+      } catch (error) {
+        failCount++;
+        console.error(`Failed to send broadcast to ${userData.userId}:`, error);
+      }
     }
   }
   
-  await ctx.reply(
-    `✅ *Broadcast Completed*\n\n` +
-    `📨 Sent to: ${successCount} users\n` +
-    `❌ Failed: ${failCount} users\n` +
-    `📊 Success rate: ${((successCount / usersArray.length) * 100).toFixed(1)}%`
+  console.log(`Broadcast sent: ${successCount} successful, ${failCount} failed`);
+}
+
+// ==================== BLOCK/UNBLOCK USER ====================
+bot.action('block_user', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  await ctx.editMessageText(
+    `❌ *Block User*\n\nEnter user ID to block:`,
+    { parse_mode: 'Markdown' }
   );
+  ctx.session.waitingForBlockUserId = true;
+  await ctx.answerCbQuery();
 });
 
-// ==================== VERCEL WEBHOOK HANDLER ====================
+bot.action('unblock_user', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  await ctx.editMessageText(
+    `✅ *Unblock User*\n\nEnter user ID to unblock:`,
+    { parse_mode: 'Markdown' }
+  );
+  ctx.session.waitingForUnblockUserId = true;
+  await ctx.answerCbQuery();
+});
+
+// ==================== BOT STATISTICS ====================
+bot.action('bot_stats', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  const stats = await getBotStats();
+  
+  const text = `📊 *Bot Statistics*\n\n`;
+  const users = `**Total Users:** ${stats.totalUsers}\n`;
+  const confessions = `**Pending Confessions:** ${stats.pendingConfessions}\n`;
+  const approved = `**Approved Confessions:** ${stats.approvedConfessions}\n`;
+  const rejected = `**Rejected Confessions:** ${stats.rejectedConfessions}\n`;
+  const total = `**Total Confessions:** ${stats.pendingConfessions + stats.approvedConfessions + stats.rejectedConfessions}\n`;
+  
+  const fullText = text + users + confessions + approved + rejected + total;
+  
+  const keyboard = [
+    [Markup.button.callback('👥 Manage Users', 'manage_users')],
+    [Markup.button.callback('📝 Review Confessions', 'review_confessions')],
+    [Markup.button.callback('🔙 Admin Menu', 'admin_menu')]
+  ];
+  
+  await ctx.editMessageText(fullText, { 
+    parse_mode: 'Markdown',
+    reply_markup: Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// ==================== ADMIN MENU RETURN ====================
+bot.action('admin_menu', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  const stats = await getBotStats();
+  
+  const text = `🔐 *Admin Dashboard*\n\n`;
+  const users = `**Total Users:** ${stats.totalUsers}\n`;
+  const confessions = `**Pending Confessions:** ${stats.pendingConfessions}\n`;
+  const approved = `**Approved Confessions:** ${stats.approvedConfessions}\n`;
+  const rejected = `**Rejected Confessions:** ${stats.rejectedConfessions}\n`;
+  
+  const fullText = text + users + confessions + approved + rejected;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('👥 Manage Users', 'manage_users')],
+    [Markup.button.callback('📝 Review Confessions', 'review_confessions')],
+    [Markup.button.callback('📢 Broadcast Message', 'broadcast_message')],
+    [Markup.button.callback('📊 Bot Statistics', 'bot_stats')],
+    [Markup.button.callback('❌ Block User', 'block_user')],
+    [Markup.button.callback('✅ Unblock User', 'unblock_user')]
+  ]);
+
+  await ctx.editMessageText(fullText, { 
+    parse_mode: 'Markdown',
+    reply_markup: keyboard.reply_markup 
+  });
+  await ctx.answerCbQuery();
+});
+
+// ==================== FIRST TIME WELCOME ====================
+bot.command('start', async (ctx) => {
+  const args = ctx.message.text.split(' ')[1];
+  
+  if (args && args.startsWith('comments_')) {
+    const confessionId = args.replace('comments_', '');
+    await showComments(ctx, confessionId);
+    return;
+  }
+  
+  // Get user profile
+  const profile = await getUserProfile(ctx.from.id);
+  
+  if (!profile.isActive) {
+    await ctx.reply('❌ Your account has been blocked by admin.');
+    return;
+  }
+  
+  // Check if user is first-time user
+  if (!profile.isRegistered) {
+    // Update user as registered
+    await db.collection('users').doc(ctx.from.id.toString()).update({
+      isRegistered: true
+    });
+    
+    // Send first-time welcome message with inline button
+    const welcomeText = `🤫 *Welcome to JU Confession Bot!*\n\nSend me your confession and it will be submitted anonymously for admin approval.\n\nYour identity will never be revealed!`;
+    
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('Continue', 'continue_to_bot')]
+    ]);
+    
+    await ctx.replyWithMarkdown(welcomeText, keyboard);
+    return;
+  }
+  
+  // Regular menu for existing users
+  await showMainMenu(ctx);
+});
+
+// Handle first-time continue button
+bot.action('continue_to_bot', async (ctx) => {
+  await showMainMenu(ctx);
+  await ctx.answerCbQuery();
+});
+
+// ==================== CONSTANT NAVIGATION BUTTONS ====================
+async function showMainMenu(ctx) {
+  const profile = await getUserProfile(ctx.from.id);
+  
+  const text = `🤫 *JU Confession Bot*\n\n`;
+  const stats = `👤 Profile: ${profile.username || 'Not set'}\n`;
+  const reputation = `⭐ Reputation: ${profile.reputation}\n`;
+  const streak = `🔥 Streak: ${profile.dailyStreak} days\n`;
+  const bio = profile.bio ? `📝 Bio: ${profile.bio}\n` : '';
+  
+  const fullText = text + stats + reputation + streak + bio + `\nChoose an option below:`;
+  
+  // Constant navigation buttons (not inline)
+  const keyboard = Markup.keyboard([
+    ['📝 Send Confession', '👤 My Profile'],
+    ['🔥 Trending', '🎯 Daily Check-in'],
+    ['🏷️ Hashtags', '🏆 Achievements'],
+    ['⚙️ Settings', 'ℹ️ About Us'],
+    ['🔍 Browse Users', '📌 Rules']
+  ]).resize();
+  
+  await ctx.replyWithMarkdown(fullText, keyboard);
+}
+
+// ==================== COMMAND HANDLERS ====================
+bot.hears('📝 Send Confession', async (ctx) => {
+  await sendConfessionCommand(ctx);
+});
+
+bot.hears('👤 My Profile', async (ctx) => {
+  await myProfileCommand(ctx);
+});
+
+bot.hears('🔥 Trending', async (ctx) => {
+  await trendingCommand(ctx);
+});
+
+bot.hears('🎯 Daily Check-in', async (ctx) => {
+  await ctx.reply('/checkin');
+});
+
+bot.hears('🏷️ Hashtags', async (ctx) => {
+  await hashtagsCommand(ctx);
+});
+
+bot.hears('🏆 Achievements', async (ctx) => {
+  await achievementsCommand(ctx);
+});
+
+bot.hears('⚙️ Settings', async (ctx) => {
+  await settingsCommand(ctx);
+});
+
+bot.hears('ℹ️ About Us', async (ctx) => {
+  await aboutUsCommand(ctx);
+});
+
+bot.hears('🔍 Browse Users', async (ctx) => {
+  await browseUsersCommand(ctx);
+});
+
+bot.hears('📌 Rules', async (ctx) => {
+  await rulesCommand(ctx);
+});
+
+// Individual command functions
+async function sendConfessionCommand(ctx) {
+  const userId = ctx.from.id;
+  
+  // Check if user is active
+  const profile = await getUserProfile(userId);
+  if (!profile.isActive) {
+    await ctx.reply('❌ Your account has been blocked by admin.');
+    return;
+  }
+  
+  // Check cooldown using persistent system
+  const canSubmit = await checkCooldown(userId, 'confession', 60000); // 1 minute cooldown
+  if (!canSubmit) {
+    const cooldownRef = await db.collection('user_cooldowns').doc(userId.toString()).get();
+    if (cooldownRef.exists) {
+      const data = cooldownRef.data();
+      const lastSubmit = data.confession || 0;
+      const waitTime = Math.ceil((60000 - (Date.now() - lastSubmit)) / 1000);
+      await ctx.reply(`Please wait ${waitTime} seconds before submitting another confession.`);
+      return;
+    }
+  }
+
+  await ctx.replyWithMarkdown(
+    `✍️ *Send Your Confession*\n\nType your confession below (max 1000 characters):\n\nYou can add hashtags like #love #study #funny`
+  );
+  
+  ctx.session.waitingForConfession = true;
+}
+
+async function myProfileCommand(ctx) {
+  const profile = await getUserProfile(ctx.from.id);
+  
+  const profileText = `👤 *Your Profile*\n\n`;
+  const username = profile.username ? `**Username:** @${profile.username}\n` : `**Username:** Not set\n`;
+  const bio = profile.bio ? `**Bio:** ${profile.bio}\n` : `**Bio:** Not set\n`;
+  const followers = `**Followers:** ${profile.followers.length}\n`;
+  const following = `**Following:** ${profile.following.length}\n`;
+  const confessions = `**Total Confessions:** ${profile.totalConfessions}\n`;
+  const reputation = `**Reputation:** ${profile.reputation}\n`;
+  const achievements = `**Achievements:** ${profile.achievementCount}\n`;
+  const streak = `**Daily Streak:** ${profile.dailyStreak} days\n`;
+  const joinDate = `**Member Since:** ${new Date(profile.joinDate).toLocaleDateString()}\n`;
+  
+  const fullText = profileText + username + bio + followers + following + confessions + reputation + achievements + streak + joinDate;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('📝 Set Username', 'set_username')],
+    [Markup.button.callback('📝 Set Bio', 'set_bio')],
+    [Markup.button.callback('👥 Followers', 'show_followers')],
+    [Markup.button.callback('👥 Following', 'show_following')],
+    [Markup.button.callback('🏆 View Achievements', 'view_achievements')],
+    [Markup.button.callback('🔍 Browse Users', 'browse_users')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+
+  await ctx.replyWithMarkdown(fullText, keyboard);
+}
+
+async function trendingCommand(ctx) {
+  const trending = await getTrendingConfessions(5);
+  
+  if (trending.length === 0) {
+    await ctx.reply('No trending confessions yet. Be the first to submit one!');
+    return;
+  }
+  
+  let trendingText = `🔥 *Trending Confessions*\n\n`;
+  
+  trending.forEach((confession, index) => {
+    trendingText += `${index + 1}. #${confession.confessionNumber}\n`;
+    trendingText += `   ${confession.text.substring(0, 100)}${confession.text.length > 100 ? '...' : ''}\n`;
+    trendingText += `   Comments: ${confession.totalComments || 0}\n\n`;
+  });
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('📝 Send Confession', 'send_confession')],
+    [Markup.button.callback('🔍 Browse Users', 'browse_users')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+
+  await ctx.replyWithMarkdown(trendingText, keyboard);
+}
+
+async function hashtagsCommand(ctx) {
+  // Get popular hashtags from recent confessions
+  const confessionsSnapshot = await db.collection('confessions')
+    .where('status', '==', 'approved')
+    .orderBy('createdAt', 'desc')
+    .limit(50)
+    .get();
+  
+  const hashtagCount = {};
+  
+  confessionsSnapshot.forEach(doc => {
+    const data = doc.data();
+    const hashtags = extractHashtags(data.text);
+    hashtags.forEach(tag => {
+      hashtagCount[tag] = (hashtagCount[tag] || 0) + 1;
+    });
+  });
+  
+  // Sort hashtags by count
+  const sortedHashtags = Object.entries(hashtagCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10);
+  
+  if (sortedHashtags.length === 0) {
+    await ctx.reply('No hashtags found yet. Use #hashtags in your confessions!');
+    return;
+  }
+  
+  let hashtagsText = `🏷️ *Popular Hashtags*\n\n`;
+  
+  sortedHashtags.forEach(([tag, count], index) => {
+    hashtagsText += `${index + 1}. ${tag} (${count} uses)\n`;
+  });
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('📝 Send Confession', 'send_confession')],
+    [Markup.button.callback('🔍 Browse Users', 'browse_users')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+
+  await ctx.replyWithMarkdown(hashtagsText, keyboard);
+}
+
+async function achievementsCommand(ctx) {
+  const profile = await getUserProfile(ctx.from.id);
+  
+  const achievements = profile.achievements || [];
+  
+  if (achievements.length === 0) {
+    await ctx.reply('No achievements yet. Start using the bot to unlock achievements!');
+    return;
+  }
+  
+  let achievementsText = `🏆 *Your Achievements*\n\n`;
+  
+  const achievementNames = {
+    'first_confession': 'First Confession',
+    'ten_confessions': 'Confession Master',
+    'fifty_followers': 'Popular User',
+    'week_streak': 'Week Streak'
+  };
+  
+  achievements.forEach(achievement => {
+    achievementsText += `• ${achievementNames[achievement] || achievement}\n`;
+  });
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🎯 Daily Check-in', 'daily_checkin')],
+    [Markup.button.callback('📝 Send Confession', 'send_confession')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+
+  await ctx.replyWithMarkdown(achievementsText, keyboard);
+}
+
+async function settingsCommand(ctx) {
+  const profile = await getUserProfile(ctx.from.id);
+  
+  const text = `⚙️ *Settings*\n\nConfigure your bot preferences:\n\n`;
+  const notifications = `**Notifications:** ${profile.notifications.confessionApproved ? '✅' : '❌'} Confession Approved\n`;
+  const comments = `**Comments:** ${profile.notifications.newComment ? '✅' : '❌'} New Comments\n`;
+  const followers = `**Followers:** ${profile.notifications.newFollower ? '✅' : '❌'} New Followers\n`;
+  
+  const fullText = text + notifications + comments + followers;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('📝 Set Username', 'set_username')],
+    [Markup.button.callback('📝 Set Bio', 'set_bio')],
+    [Markup.button.callback('🔍 Browse Users', 'browse_users')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+
+  await ctx.replyWithMarkdown(fullText, keyboard);
+}
+
+async function aboutUsCommand(ctx) {
+  const text = `ℹ️ *About Us*\n\nThis is an anonymous confession platform for JU students.\n\nFeatures:\n• Anonymous confessions\n• Admin approval system\n• User profiles\n• Social features\n• Comment system\n• Reputation system\n• Achievements\n• Daily check-ins\n\n100% private and secure.`;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('📝 Send Confession', 'send_confession')],
+    [Markup.button.callback('🎯 Daily Check-in', 'daily_checkin')],
+    [Markup.button.callback('🔍 Browse Users', 'browse_users')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+
+  await ctx.replyWithMarkdown(text, keyboard);
+}
+
+async function browseUsersCommand(ctx) {
+  // Get all users except current user
+  const usersSnapshot = await db.collection('users')
+    .where('username', '!=', null) // Only users with usernames
+    .where('isActive', '==', true) // Only active users
+    .orderBy('reputation', 'desc') // Sort by reputation
+    .limit(10)
+    .get();
+  
+  if (usersSnapshot.empty) {
+    await ctx.reply(
+      `🔍 *Browse Users*\n\nNo users found.`
+    );
+    return;
+  }
+  
+  let usersText = `🔍 *Browse Users*\n\n`;
+  const keyboard = [];
+  
+  for (const doc of usersSnapshot.docs) {
+    const userData = doc.data();
+    if (userData.userId === ctx.from.id) continue; // Skip current user
+    
+    const name = userData.username;
+    const bio = userData.bio || 'No bio';
+    const followers = userData.followers.length;
+    const reputation = userData.reputation;
+    
+    usersText += `• @${name} (${reputation}⭐, ${followers} followers)\n`;
+    usersText += `  ${bio}\n\n`;
+    
+    keyboard.push([
+      Markup.button.callback(`👤 View @${name}`, `view_profile_${userData.userId}`)
+    ]);
+  }
+  
+  keyboard.push([Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]);
+  
+  await ctx.replyWithMarkdown(usersText, Markup.inlineKeyboard(keyboard));
+}
+
+async function rulesCommand(ctx) {
+  const text = `📌 *Confession Rules*\n\n✅ Be respectful\n✅ No personal attacks\n✅ No spam or ads\n✅ Keep it anonymous\n✅ No hate speech\n✅ No illegal content\n✅ No harassment\n✅ Use appropriate hashtags`;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('📝 Send Confession', 'send_confession')],
+    [Markup.button.callback('🎯 Daily Check-in', 'daily_checkin')],
+    [Markup.button.callback('🔍 Browse Users', 'browse_users')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+
+  await ctx.replyWithMarkdown(text, keyboard);
+}
+
+// Back to menu action
+bot.action('back_to_menu', async (ctx) => {
+  await showMainMenu(ctx);
+  await ctx.answerCbQuery();
+});
+
+// Daily check-in action
+bot.action('daily_checkin', async (ctx) => {
+  await ctx.reply('/checkin');
+  await ctx.answerCbQuery();
+});
+
+// View achievements action
+bot.action('view_achievements', async (ctx) => {
+  await achievementsCommand(ctx);
+  await ctx.answerCbQuery();
+});
+
+// ==================== MY PROFILE ACTIONS ====================
+bot.action('show_followers', async (ctx) => {
+  const profile = await getUserProfile(ctx.from.id);
+  const followerIds = profile.followers || [];
+  
+  if (followerIds.length === 0) {
+    await ctx.editMessageText(
+      `👥 *Your Followers*\n\nNo followers yet.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  let followersText = `👥 *Your Followers (${followerIds.length})*\n\n`;
+  
+  for (const followerId of followerIds) {
+    const followerProfile = await getUserProfile(followerId);
+    const name = followerProfile.username || 'Anonymous';
+    const reputation = followerProfile.reputation;
+    followersText += `• @${name} (${reputation}⭐)\n`;
+  }
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🔍 Browse Users', 'browse_users')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+  
+  await ctx.editMessageText(followersText, { 
+    parse_mode: 'Markdown',
+    reply_markup: keyboard.reply_markup 
+  });
+});
+
+bot.action('show_following', async (ctx) => {
+  const profile = await getUserProfile(ctx.from.id);
+  const followingIds = profile.following || [];
+  
+  if (followingIds.length === 0) {
+    await ctx.editMessageText(
+      `👥 *You're Following*\n\nNot following anyone yet.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  let followingText = `👥 *You're Following (${followingIds.length})*\n\n`;
+  
+  for (const followingId of followingIds) {
+    const followingProfile = await getUserProfile(followingId);
+    const name = followingProfile.username || 'Anonymous';
+    const reputation = followingProfile.reputation;
+    followingText += `• @${name} (${reputation}⭐)\n`;
+  }
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🔍 Browse Users', 'browse_users')],
+    [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+  ]);
+  
+  await ctx.editMessageText(followingText, { 
+    parse_mode: 'Markdown',
+    reply_markup: keyboard.reply_markup 
+  });
+});
+
+// ==================== BROWSE USERS ====================
+bot.action('browse_users', async (ctx) => {
+  // Get all users except current user
+  const usersSnapshot = await db.collection('users')
+    .where('username', '!=', null) // Only users with usernames
+    .where('isActive', '==', true) // Only active users
+    .orderBy('reputation', 'desc') // Sort by reputation
+    .limit(10)
+    .get();
+  
+  if (usersSnapshot.empty) {
+    await ctx.editMessageText(
+      `🔍 *Browse Users*\n\nNo users found.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  let usersText = `🔍 *Browse Users*\n\n`;
+  const keyboard = [];
+  
+  for (const doc of usersSnapshot.docs) {
+    const userData = doc.data();
+    if (userData.userId === ctx.from.id) continue; // Skip current user
+    
+    const name = userData.username;
+    const bio = userData.bio || 'No bio';
+    const followers = userData.followers.length;
+    const reputation = userData.reputation;
+    
+    usersText += `• @${name} (${reputation}⭐, ${followers} followers)\n`;
+    usersText += `  ${bio}\n\n`;
+    
+    keyboard.push([
+      Markup.button.callback(`👤 View @${name}`, `view_profile_${userData.userId}`)
+    ]);
+  }
+  
+  keyboard.push([Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]);
+  
+  await ctx.editMessageText(usersText, { 
+    parse_mode: 'Markdown',
+    reply_markup: Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// ==================== VIEW USER PROFILE ====================
+bot.action(/view_profile_(.+)/, async (ctx) => {
+  const targetUserId = ctx.match[1];
+  const targetProfile = await getUserProfile(targetUserId);
+  const currentUserProfile = await getUserProfile(ctx.from.id);
+  
+  const profileText = `👤 *Profile*\n\n`;
+  const username = targetProfile.username ? `**Username:** @${targetProfile.username}\n` : '';
+  const bio = targetProfile.bio ? `**Bio:** ${targetProfile.bio}\n` : `**Bio:** No bio\n`;
+  const followers = `**Followers:** ${targetProfile.followers.length}\n`;
+  const following = `**Following:** ${targetProfile.following.length}\n`;
+  const confessions = `**Confessions:** ${targetProfile.totalConfessions}\n`;
+  const reputation = `**Reputation:** ${targetProfile.reputation}⭐\n`;
+  const achievements = `**Achievements:** ${targetProfile.achievementCount}\n`;
+  const joinDate = `**Member Since:** ${new Date(targetProfile.joinDate).toLocaleDateString()}\n`;
+  
+  const fullText = profileText + username + bio + followers + following + confessions + reputation + achievements + joinDate;
+  
+  // Check if user is already following
+  const isFollowing = currentUserProfile.following.includes(parseInt(targetUserId));
+  
+  const keyboard = [
+    [isFollowing 
+      ? Markup.button.callback('✅ Following', `unfollow_${targetUserId}`)
+      : Markup.button.callback('➕ Follow', `follow_${targetUserId}`)
+    ]
+  ];
+  
+  keyboard.push([Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]);
+  
+  await ctx.editMessageText(fullText, { 
+    parse_mode: 'Markdown',
+    reply_markup: Markup.inlineKeyboard(keyboard)
+  });
+});
+
+// ==================== FOLLOW/UNFOLLOW ====================
+bot.action(/follow_(.+)/, async (ctx) => {
+  const targetUserId = parseInt(ctx.match[1]);
+  
+  if (targetUserId === ctx.from.id) {
+    await ctx.answerCbQuery('❌ You cannot follow yourself');
+    return;
+  }
+  
+  try {
+    // Add to current user's following
+    await db.collection('users').doc(ctx.from.id.toString()).update({
+      following: admin.firestore.FieldValue.arrayUnion(targetUserId)
+    });
+    
+    // Add to target user's followers
+    await db.collection('users').doc(targetUserId.toString()).update({
+      followers: admin.firestore.FieldValue.arrayUnion(ctx.from.id)
+    });
+    
+    await ctx.answerCbQuery('✅ Following!');
+    
+    // Update the message
+    const targetProfile = await getUserProfile(targetUserId);
+    const profileText = `👤 *Profile*\n\n`;
+    const username = targetProfile.username ? `**Username:** @${targetProfile.username}\n` : '';
+    const bio = targetProfile.bio ? `**Bio:** ${targetProfile.bio}\n` : `**Bio:** No bio\n`;
+    const followers = `**Followers:** ${targetProfile.followers.length + 1}\n`;
+    const following = `**Following:** ${targetProfile.following.length}\n`;
+    const confessions = `**Confessions:** ${targetProfile.totalConfessions}\n`;
+    const reputation = `**Reputation:** ${targetProfile.reputation}⭐\n`;
+    const achievements = `**Achievements:** ${targetProfile.achievementCount}\n`;
+    const joinDate = `**Member Since:** ${new Date(targetProfile.joinDate).toLocaleDateString()}\n`;
+    
+    const fullText = profileText + username + bio + followers + following + confessions + reputation + achievements + joinDate;
+    
+    const keyboard = [
+      [Markup.button.callback('✅ Following', `unfollow_${targetUserId}`)],
+      [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+    ];
+    
+    await ctx.editMessageText(fullText, { 
+      parse_mode: 'Markdown',
+      reply_markup: Markup.inlineKeyboard(keyboard)
+    });
+    
+  } catch (error) {
+    console.error('Follow error:', error);
+    await ctx.answerCbQuery('❌ Error following user');
+  }
+});
+
+bot.action(/unfollow_(.+)/, async (ctx) => {
+  const targetUserId = parseInt(ctx.match[1]);
+  
+  try {
+    // Remove from current user's following
+    await db.collection('users').doc(ctx.from.id.toString()).update({
+      following: admin.firestore.FieldValue.arrayRemove(targetUserId)
+    });
+    
+    // Remove from target user's followers
+    await db.collection('users').doc(targetUserId.toString()).update({
+      followers: admin.firestore.FieldValue.arrayRemove(ctx.from.id)
+    });
+    
+    await ctx.answerCbQuery('❌ Unfollowed');
+    
+    // Update the message
+    const targetProfile = await getUserProfile(targetUserId);
+    const profileText = `👤 *Profile*\n\n`;
+    const username = targetProfile.username ? `**Username:** @${targetProfile.username}\n` : '';
+    const bio = targetProfile.bio ? `**Bio:** ${targetProfile.bio}\n` : `**Bio:** No bio\n`;
+    const followers = `**Followers:** ${Math.max(0, targetProfile.followers.length - 1)}\n`;
+    const following = `**Following:** ${targetProfile.following.length}\n`;
+    const confessions = `**Confessions:** ${targetProfile.totalConfessions}\n`;
+    const reputation = `**Reputation:** ${targetProfile.reputation}⭐\n`;
+    const achievements = `**Achievements:** ${targetProfile.achievementCount}\n`;
+    const joinDate = `**Member Since:** ${new Date(targetProfile.joinDate).toLocaleDateString()}\n`;
+    
+    const fullText = profileText + username + bio + followers + following + confessions + reputation + achievements + joinDate;
+    
+    const keyboard = [
+      [Markup.button.callback('➕ Follow', `follow_${targetUserId}`)],
+      [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+    ];
+    
+    await ctx.editMessageText(fullText, { 
+      parse_mode: 'Markdown',
+      reply_markup: Markup.inlineKeyboard(keyboard)
+    });
+    
+  } catch (error) {
+    console.error('Unfollow error:', error);
+    await ctx.answerCbQuery('❌ Error unfollowing user');
+  }
+});
+
+// ==================== SET USERNAME ====================
+bot.action('set_username', async (ctx) => {
+  await ctx.editMessageText(
+    `📝 *Set Username*\n\nEnter your desired username (without @):\n\nMust be 3-20 characters, letters/numbers/underscores only.`,
+    { parse_mode: 'Markdown' }
+  );
+  ctx.session.waitingForUsername = true;
+  await ctx.answerCbQuery();
+});
+
+// ==================== SET BIO ====================
+bot.action('set_bio', async (ctx) => {
+  await ctx.editMessageText(
+    `📝 *Set Bio*\n\nEnter your bio (max 100 characters):`,
+    { parse_mode: 'Markdown' }
+  );
+  ctx.session.waitingForBio = true;
+  await ctx.answerCbQuery();
+});
+
+// ==================== SEND CONFESSION ====================
+bot.action('send_confession', async (ctx) => {
+  await sendConfessionCommand(ctx);
+  await ctx.answerCbQuery();
+});
+
+async function handleConfession(ctx, text) {
+  const userId = ctx.from.id;
+
+  // Validate confession
+  if (!text || text.trim().length < 5) {
+    await ctx.reply('❌ Confession too short. Minimum 5 characters.');
+    ctx.session.waitingForConfession = false;
+    return;
+  }
+
+  if (text.length > 1000) {
+    await ctx.reply('❌ Confession too long. Maximum 1000 characters.');
+    ctx.session.waitingForConfession = false;
+    return;
+  }
+
+  try {
+    // Sanitize input
+    const sanitizedText = sanitizeInput(text);
+    
+    // Generate confession ID (confession number will be assigned during approval)
+    const confessionId = `confess_${userId}_${Date.now()}`;
+    
+    // Extract hashtags
+    const hashtags = extractHashtags(sanitizedText);
+    
+    // Save to Firebase - FIXED: Removed confessionNumber from pending confessions
+    await db.collection('confessions').doc(confessionId).set({
+      confessionId: confessionId,
+      userId: userId,
+      text: sanitizedText.trim(),
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      hashtags: hashtags,
+      totalComments: 0
+    });
+
+    // Update user profile
+    await db.collection('users').doc(userId.toString()).update({
+      totalConfessions: admin.firestore.FieldValue.increment(1)
+    });
+
+    // Set persistent cooldown
+    await setCooldown(userId, 'confession');
+
+    // Notify admin
+    await notifyAdmins(confessionId, sanitizedText);
+    
+    ctx.session.waitingForConfession = false;
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('📝 Send Another', 'send_confession')],
+      [Markup.button.callback('🎯 Daily Check-in', 'daily_checkin')],
+      [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+    ]);
+
+    await ctx.replyWithMarkdown(
+      `✅ *Confession Submitted!*\n\nYour confession is under review. You'll be notified when approved.`,
+      keyboard
+    );
+    
+    // Check for achievements
+    await checkAchievements(userId);
+    
+  } catch (error) {
+    console.error('Submission error:', error);
+    await ctx.reply('❌ Error submitting confession. Please try again.');
+    ctx.session.waitingForConfession = false;
+  }
+}
+
+// ==================== ADMIN NOTIFICATION ====================
+async function notifyAdmins(confessionId, text) {
+  const adminIds = process.env.ADMIN_IDS?.split(',').map(id => id.trim()) || [];
+  
+  const message = `🤫 *New Confession*\n\n${text}\n\n*Actions:*`;
+
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('✅ Approve', `approve_${confessionId}`),
+      Markup.button.callback('❌ Reject', `reject_${confessionId}`)
+    ]
+  ]);
+
+  for (const adminId of adminIds) {
+    try {
+      await bot.telegram.sendMessage(adminId, message, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard.reply_markup
+      });
+    } catch (error) {
+      console.error(`Admin notify error ${adminId}:`, error);
+    }
+  }
+}
+
+// ==================== ADMIN APPROVAL ====================
+bot.action(/approve_(.+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  const confessionId = ctx.match[1];
+  
+  try {
+    const doc = await db.collection('confessions').doc(confessionId).get();
+    if (!doc.exists) {
+      await ctx.answerCbQuery('❌ Confession not found');
+      return;
+    }
+
+    const confession = doc.data();
+    
+    // FIXED: Get next confession number from Firestore (only during approval)
+    const nextNumber = await getNextConfessionNumber();
+    
+    // Update confession with assigned number
+    await db.collection('confessions').doc(confessionId).update({
+      status: 'approved',
+      confessionNumber: nextNumber, // FIXED: Assign number during approval only
+      approvedAt: new Date().toISOString()
+    });
+
+    // Post to channel WITH PROPER COMMENT BUTTONS
+    await postToChannel(confession.text, nextNumber, confessionId);
+
+    // Update reputation (10 points for approved confession)
+    await updateReputation(confession.userId, 10);
+
+    // Notify user
+    await notifyUser(confession.userId, nextNumber, 'approved');
+
+    // Update admin message
+    await ctx.editMessageText(
+      `✅ *Confession #${nextNumber} Approved!*\n\nPosted to channel successfully.`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    await ctx.answerCbQuery('Approved!');
+
+    // Check for achievements
+    await checkAchievements(confession.userId);
+
+  } catch (error) {
+    console.error('Approval error:', error);
+    await ctx.answerCbQuery('❌ Approval failed');
+  }
+});
+
+// ==================== ADMIN REJECTION ====================
+bot.action(/reject_(.+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  const confessionId = ctx.match[1];
+  
+  await ctx.editMessageText(
+    `❌ *Rejecting Confession*\n\nPlease provide rejection reason:`,
+    { parse_mode: 'Markdown' }
+  );
+  ctx.session.rejectingConfession = confessionId;
+  await ctx.answerCbQuery();
+});
+
+async function handleRejection(ctx, reason) {
+  const confessionId = ctx.session.rejectingConfession;
+  
+  try {
+    const doc = await db.collection('confessions').doc(confessionId).get();
+    if (doc.exists) {
+      const confession = doc.data();
+      
+      await db.collection('confessions').doc(confessionId).update({
+        status: 'rejected',
+        rejectionReason: reason,
+        rejectedAt: new Date().toISOString()
+      });
+
+      // Notify user
+      await notifyUser(confession.userId, 0, 'rejected', reason);
+
+      await ctx.reply(`✅ Confession rejected.`);
+    }
+  } catch (error) {
+    console.error('Rejection error:', error);
+    await ctx.reply('❌ Rejection failed');
+  }
+  
+  ctx.session.rejectingConfession = null;
+}
+
+// ==================== CHANNEL POSTING WITH COMMENT SYSTEM ====================
+async function postToChannel(text, number, confessionId) {
+  const channelId = process.env.CHANNEL_ID;
+  
+  const message = `#${number}\n\n${text}`;
+
+  try {
+    // Send the confession to channel
+    const channelMessage = await bot.telegram.sendMessage(channelId, message);
+    
+    // Create a comment button that redirects to bot
+    const commentButton = Markup.inlineKeyboard([
+      [Markup.button.url('👁️‍🗨️ View/Add Comments', `https://t.me/${bot.botInfo.username}?start=comments_${confessionId}`)]
+    ]);
+
+    // Edit the message to add comment button
+    await bot.telegram.editMessageText(
+      channelId,
+      channelMessage.message_id,
+      undefined,
+      `${message}\n\n[ 👁️‍🗨️ View/Add Comments (0) ]`, // This is just text, not a button
+      commentButton
+    );
+
+    // Create a separate comment section in bot
+    await createCommentSection(confessionId, number, text);
+    
+  } catch (error) {
+    console.error('Channel post error:', error);
+  }
+}
+
+// ==================== COMMENT SYSTEM ====================
+async function createCommentSection(confessionId, number, confessionText) {
+  // Create a document to store comments
+  await db.collection('comments').doc(confessionId).set({
+    confessionId: confessionId,
+    confessionNumber: number,
+    confessionText: confessionText,
+    comments: [],
+    totalComments: 0
+  });
+}
+
+// Show comments for a confession
+async function showComments(ctx, confessionId) {
+  try {
+    const commentDoc = await db.collection('comments').doc(confessionId).get();
+    if (!commentDoc.exists) {
+      await ctx.reply('❌ Confession not found.');
+      return;
+    }
+
+    const data = commentDoc.data();
+    const comments = data.comments || [];
+    
+    let commentText = `💬 Comments for Confession #${data.confessionNumber}\n\n`;
+    
+    if (comments.length === 0) {
+      commentText += 'No comments yet. Be the first to comment!\n\n';
+    } else {
+      commentText += `Total Comments: ${comments.length}\n\n`;
+      comments.forEach((comment, index) => {
+        commentText += `${index + 1}. ${comment.text}\n`;
+        commentText += `   - ${comment.timestamp}\n\n`;
+      });
+    }
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('📝 Add Comment', `add_comment_${confessionId}`)],
+      [Markup.button.callback('🔄 Refresh', `refresh_comments_${confessionId}`)],
+      [Markup.button.callback('🎯 Daily Check-in', 'daily_checkin')],
+      [Markup.button.callback('🔙 Back to Menu', 'back_to_menu')]
+    ]);
+
+    await ctx.replyWithMarkdown(commentText, keyboard);
+  } catch (error) {
+    console.error('Show comments error:', error);
+    await ctx.reply('❌ Error loading comments.');
+  }
+}
+
+// Handle comment actions
+bot.action(/^add_comment_(.+)$/, async (ctx) => {
+  const confessionId = ctx.match[1];
+  
+  await ctx.editMessageText(
+    `📝 *Add Comment*\n\nType your comment for this confession:`,
+    { parse_mode: 'Markdown' }
+  );
+  
+  ctx.session.waitingForComment = confessionId;
+  await ctx.answerCbQuery();
+});
+
+bot.action(/^refresh_comments_(.+)$/, async (ctx) => {
+  const confessionId = ctx.match[1];
+  await showComments(ctx, confessionId);
+  await ctx.answerCbQuery();
+});
+
+async function addComment(ctx, commentText) {
+  const userId = ctx.from.id;
+  const confessionId = ctx.session.waitingForComment;
+  
+  if (!commentText || commentText.trim().length < 3) {
+    await ctx.reply('❌ Comment too short. Minimum 3 characters.');
+    return;
+  }
+
+  try {
+    // FIXED: Add comment rate limiting
+    const canComment = await checkCommentRateLimit(userId);
+    if (!canComment) {
+      await ctx.reply('❌ Too many comments. Please wait before adding another comment.');
+      return;
+    }
+
+    const commentDoc = await db.collection('comments').doc(confessionId).get();
+    if (!commentDoc.exists) {
+      await ctx.reply('❌ Confession not found.');
+      return;
+    }
+
+    // Sanitize comment text
+    const sanitizedComment = sanitizeInput(commentText);
+
+    const commentData = {
+      id: `comment_${Date.now()}_${userId}`,
+      text: sanitizedComment.trim(),
+      userId: userId,
+      userName: ctx.from.first_name,
+      timestamp: new Date().toLocaleString(),
+      createdAt: new Date().toISOString()
+    };
+
+    // Use transaction to ensure both updates happen together
+    await db.runTransaction(async (transaction) => {
+      const commentRef = db.collection('comments').doc(confessionId);
+      const confessionRef = db.collection('confessions').doc(confessionId);
+      
+      transaction.update(commentRef, {
+        comments: admin.firestore.FieldValue.arrayUnion(commentData),
+        totalComments: admin.firestore.FieldValue.increment(1)
+      });
+      
+      transaction.update(confessionRef, {
+        totalComments: admin.firestore.FieldValue.increment(1)
+      });
+    });
+
+    // FIXED: Record comment for rate limiting
+    await recordComment(userId);
+
+    // Update reputation for commenting (5 points)
+    await updateReputation(userId, 5);
+
+    await ctx.reply('✅ Comment added successfully!');
+    
+    // Show updated comments
+    await showComments(ctx, confessionId);
+    
+    // Clear session
+    ctx.session.waitingForComment = null;
+    
+    // Check for achievements
+    await checkAchievements(userId);
+    
+  } catch (error) {
+    console.error('Add comment error:', error);
+    await ctx.reply('❌ Error adding comment.');
+  }
+}
+
+// ==================== USER NOTIFICATION ====================
+async function notifyUser(userId, number, status, reason = '') {
+  try {
+    let message = '';
+    if (status === 'approved') {
+      message = `🎉 *Your Confession #${number} was approved!*\n\nIt has been posted to the channel.\n\n⭐ +10 reputation points`;
+    } else {
+      message = `❌ *Confession Not Approved*\n\nReason: ${reason}\n\nYou can submit a new one.`;
+    }
+
+    await bot.telegram.sendMessage(userId, message, { parse_mode: 'Markdown' });
+  } catch (error) {
+    console.error('User notify error:', error);
+  }
+}
+
+// ==================== ADMIN MESSAGING ====================
+bot.action(/message_(.+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('❌ Access denied');
+    return;
+  }
+  
+  const userId = ctx.match[1];
+  await ctx.editMessageText(`📩 Messaging user ID: ${userId}\n\nType your message:`);
+  ctx.session.messagingUser = userId;
+  await ctx.answerCbQuery();
+});
+
+async function handleAdminMessage(ctx, text) {
+  const userId = ctx.session.messagingUser;
+
+  try {
+    await bot.telegram.sendMessage(userId, `📩 *Admin Message*\n\n${text}`, { parse_mode: 'Markdown' });
+    await ctx.reply(`✅ Message sent to user ID: ${userId}`);
+  } catch (error) {
+    await ctx.reply(`❌ Failed to send message to user ID: ${userId}. User may have blocked bot.`);
+  }
+  
+  ctx.session.messagingUser = null;
+}
+
+// ==================== ERROR HANDLING ====================
+bot.catch((err, ctx) => {
+  console.error(`Bot error:`, err);
+  ctx.reply('❌ An error occurred. Please try again.');
+});
+
+// ==================== VERCEL HANDLER ====================
 module.exports = async (req, res) => {
   try {
-    console.log('🤖 Webhook received');
+    // Initialize counter on first request (or after restart)
+    if (confessionCounter === 0) {
+      await initializeCounter();
+    }
+    
     await bot.handleUpdate(req.body);
     res.status(200).send('OK');
   } catch (error) {
-    console.error('❌ Webhook error:', error);
-    res.status(200).send('OK'); // Always return 200 to Telegram
+    console.error('Webhook error:', error);
+    res.status(500).send('Error');
   }
 };
 
 // ==================== LOCAL DEVELOPMENT ====================
 if (process.env.NODE_ENV === 'development') {
-  bot.launch().then(() => {
-    console.log('🚀 JU Registration Bot started in development mode');
+  initializeCounter().then(() => {
+    bot.launch().then(() => {
+      console.log('🤫 JU Confession Bot running locally');
+    });
   });
   
-  // Enable graceful stop
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
-}
-
-console.log('✅ Bot module loaded successfully');
+    }
